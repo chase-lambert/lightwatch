@@ -39,13 +39,24 @@ impl CpuCollector {
                     reason: "cpu counter decrease",
                 });
 
-            let per_core_pct: Vec<Reading<f32>> = per_core_percent(prev, curr)
+            let per_core_pct: Vec<CoreReading> = per_core_percent(prev, curr)
                 .into_iter()
-                .map(|(_, pct)| match pct {
-                    Some(v) => Reading::Value(v),
-                    None => Reading::Unavailable {
-                        reason: "new core or counter decrease",
-                    },
+                .map(|(label, pct)| {
+                    // Parse core id from "cpuN" label
+                    let numeric_id = label
+                        .strip_prefix("cpu")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    CoreReading {
+                        id: CoreId(numeric_id),
+                        label,
+                        value: match pct {
+                            Some(v) => Reading::Value(v),
+                            None => Reading::Unavailable {
+                                reason: "new core or counter decrease",
+                            },
+                        },
+                    }
                 })
                 .collect();
 
@@ -67,6 +78,7 @@ impl CpuCollector {
         CpuSnapshot {
             usage_percent,
             per_core_percent: per_core,
+            core_hidden: 0,
             temp_celsius: temp,
             freq_mhz: freq,
         }

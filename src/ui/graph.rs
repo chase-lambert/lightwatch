@@ -1,57 +1,57 @@
+//! Multi-series charts for the lightwatch dashboard.
+//! Thin iced adapter over pure geometry from graph_geom.
+
+use super::graph_geom::{self, DrawWindow, PlotBounds};
 use crate::model::SamplePoint;
 use iced::mouse;
-use iced::widget::canvas::{self, Cache, Event, Frame, Geometry, Path, Stroke};
-use iced::{Color, Point, Rectangle};
+use iced::widget::canvas::{self, Event, Frame, Geometry, Path, Stroke};
+use iced::{Color, Point, Rectangle, Size};
 
-/// A sparkline canvas that draws a time-series from `SamplePoint` rings.
-pub struct Sparkline {
+/// A single series descriptor for the multi-series chart.
+pub struct SeriesData {
     pub points: Vec<SamplePoint>,
     pub color: Color,
     pub max_value: f32,
-    pub window_secs: f64,
-    cache: Cache,
+    /// Enable light fill under the line (only for single-series charts).
+    pub fill: bool,
 }
 
-impl Sparkline {
-    pub fn new(color: Color) -> Self {
+/// Multi-series chart canvas. Rebuilds geometry every frame from pure
+/// graph_geom functions; no Cache involved for dynamic series paths.
+pub struct MultiChart {
+    pub series: Vec<SeriesData>,
+    pub window: DrawWindow,
+    pub show_grid: bool,
+}
+
+impl MultiChart {
+    pub fn new(show_grid: bool) -> Self {
         Self {
-            points: Vec::new(),
-            color,
-            max_value: 100.0,
-            window_secs: 900.0,
-            cache: Cache::new(),
+            series: Vec::new(),
+            window: DrawWindow {
+                window_secs: 60.0,
+                window_end_ns: 0,
+            },
+            show_grid,
         }
     }
-
-    pub fn update(&mut self, points: Vec<SamplePoint>, max_value: f32, window_secs: f64) {
-        self.points = points;
-        self.max_value = max_value.max(1.0);
-        self.window_secs = window_secs.max(1.0);
-        self.cache.clear();
-    }
 }
 
-impl<Message> canvas::Program<Message> for Sparkline {
+impl<Message> canvas::Program<Message> for MultiChart {
     type State = ();
 
     fn draw(
         &self,
         _state: &Self::State,
-        renderer: &iced::Renderer,
+        _renderer: &iced::Renderer,
         _theme: &iced::Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry<iced::Renderer>> {
-        let geom = self.cache.draw(renderer, bounds.size(), |frame| {
-            draw_sparkline(
-                frame,
-                &self.points,
-                self.color,
-                self.max_value,
-                self.window_secs,
-            );
-        });
-        vec![geom]
+        // Build a fresh geometry each frame.
+        let mut frame = Frame::new(_renderer, bounds.size());
+        draw_multi_chart(&mut frame, self, bounds.size());
+        vec![frame.into_geometry()]
     }
 
     fn update(
@@ -74,90 +74,92 @@ impl<Message> canvas::Program<Message> for Sparkline {
     }
 }
 
-fn draw_sparkline(
-    frame: &mut Frame,
-    points: &[SamplePoint],
-    color: Color,
-    max_value: f32,
-    window_secs: f64,
-) {
-    if points.len() < 2 {
+fn draw_multi_chart(frame: &mut Frame, chart: &MultiChart, size: Size) {
+    if size.width <= 0.0 || size.height <= 0.0 {
         return;
     }
 
-    let width = frame.width();
-    let height = frame.height();
-    if width <= 0.0 || height <= 0.0 {
-        return;
-    }
+    let margin = 4.0;
+    let bounds = PlotBounds {
+        width: size.width,
+        height: size.height,
+        margin,
+    };
 
-    let margin = 2.0;
-    let plot_width = width - 2.0 * margin;
-    let plot_height = height - 2.0 * margin;
-
-    // Compute time range. Right edge = latest point's t_boot_ns (including
-    // gaps — not only non-gap values). Left edge = right − window_secs.
-    // Convert to u64 ns for the computation.
-    let window_ns = (window_secs * 1e9) as u64;
-    let window_end = points.last().map(|pt| pt.t_boot_ns).unwrap_or(0);
-    let window_start = window_end.saturating_sub(window_ns);
-
-    // Build segments: connect consecutive non-gap points within the window.
-    let mut segments: Vec<Vec<(f32, f32)>> = Vec::new();
-    let mut current: Vec<(f32, f32)> = Vec::new();
-
-    for pt in points {
-        // Exclude points older than the window (no clamping to left edge).
-        if pt.t_boot_ns < window_start {
-            continue;
-        }
-        if let Some(val) = pt.value {
-            // Map timestamp to X position within the window
-            let t_offset = pt.t_boot_ns.saturating_sub(window_start);
-            let x =
-                margin + ((t_offset as f64 / window_ns.max(1) as f64).min(1.0) as f32 * plot_width);
-            let y = margin + plot_height - (val / max_value * plot_height);
-            current.push((x, y));
-        } else {
-            if current.len() >= 2 {
-                segments.push(std::mem::take(&mut current));
-            } else {
-                current.clear();
-            }
+    // Draw grid if enabled
+    if chart.show_grid {
+        let ys = graph_geom::compute_grid_y(&bounds);
+        let grid_stroke = Stroke::default()
+            .with_color(Color {
+                r: 0.3,
+                g: 0.3,
+                b: 0.35,
+                a: 0.3,
+            })
+            .with_width(0.5);
+        for y in ys {
+            let path = Path::line(
+                Point::new(bounds.margin, y),
+                Point::new(bounds.width - bounds.margin, y),
+            );
+            frame.stroke(&path, grid_stroke);
         }
     }
-    if current.len() >= 2 {
-        segments.push(current);
-    }
 
-    let stroke = Stroke::default().with_color(color).with_width(1.5);
+    // Draw each series
+    for (idx, series) in chart.series.iter().enumerate() {
+        let geom = graph_geom::compute_series(
+            &series.points,
+            series.max_value,
+            &chart.window,
+            &bounds,
+            false, // no decimation by default
+        );
 
-    for seg in &segments {
-        let path = Path::new(|builder| {
-            builder.move_to(Point::new(seg[0].0, seg[0].1));
-            for (x, y) in &seg[1..] {
-                builder.line_to(Point::new(*x, *y));
+        let stroke = Stroke::default()
+            .with_color(series.color)
+            .with_width(1.5);
+
+        // Stroke all segments for this series
+        for seg in &geom.segments {
+            if seg.is_empty() {
+                continue;
             }
-        });
-        frame.stroke(&path, stroke);
-    }
+            let path = Path::new(|builder| {
+                builder.move_to(Point::new(seg[0].0, seg[0].1));
+                for (x, y) in &seg[1..] {
+                    builder.line_to(Point::new(*x, *y));
+                }
+            });
+            frame.stroke(&path, stroke);
+        }
 
-    // Fill under the first segment
-    if let Some(seg) = segments.first()
-        && seg.len() >= 2
-    {
-        let first = seg[0];
-        let last = seg[seg.len() - 1];
-        let fill_path = Path::new(|builder| {
-            builder.move_to(Point::new(first.0, first.1));
-            for (x, y) in &seg[1..] {
-                builder.line_to(Point::new(*x, *y));
-            }
-            builder.line_to(Point::new(last.0, margin + plot_height));
-            builder.line_to(Point::new(first.0, margin + plot_height));
-            builder.close();
-        });
-        let fill_color = Color { a: 0.1, ..color };
-        frame.fill(&fill_path, fill_color);
+        // Fill under the first segment (only when fill enabled and single segment)
+        if series.fill
+            && geom.segments.len() == 1
+            && let Some(seg) = geom.segments.first()
+            && seg.len() >= 2
+        {
+            let first = seg[0];
+            let last = seg[seg.len() - 1];
+            let baseline_y = bounds.margin + (bounds.height - 2.0 * bounds.margin);
+            let fill_path = Path::new(|builder| {
+                builder.move_to(Point::new(first.0, first.1));
+                for (x, y) in &seg[1..] {
+                    builder.line_to(Point::new(*x, *y));
+                }
+                builder.line_to(Point::new(last.0, baseline_y));
+                builder.line_to(Point::new(first.0, baseline_y));
+                builder.close();
+            });
+            let fill_color = Color {
+                a: 0.1,
+                ..series.color
+            };
+            frame.fill(&fill_path, fill_color);
+        }
+
+        // Prevent unused variable warning
+        let _ = idx;
     }
 }

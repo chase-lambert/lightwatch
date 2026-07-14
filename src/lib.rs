@@ -1,6 +1,8 @@
 use clap::Parser;
 use std::process;
 
+use crate::model::history::{DEFAULT_HISTORY_SECS, DEFAULT_INTERVAL_MS};
+
 pub mod collect;
 pub mod diag;
 pub mod model;
@@ -49,11 +51,11 @@ struct Cli {
     soak: Option<u64>,
 
     /// Sampling interval in milliseconds
-    #[arg(long, default_value = "1000")]
+    #[arg(long, default_value_t = DEFAULT_INTERVAL_MS)]
     interval: u64,
 
-    /// History window in seconds
-    #[arg(long, default_value = "900")]
+    /// History window in seconds (default 60)
+    #[arg(long, default_value_t = DEFAULT_HISTORY_SECS)]
     history: u64,
 }
 

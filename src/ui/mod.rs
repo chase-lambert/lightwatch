@@ -1,4 +1,5 @@
 pub mod graph;
+pub mod graph_geom;
 pub mod theme;
 pub mod view;
 

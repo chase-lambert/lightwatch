@@ -59,6 +59,8 @@ pub struct Sampler {
     prev_t_boot_ns: Option<u64>, // previous sample's boottime for gap detection
     #[allow(dead_code)]
     core_count: usize,
+    /// Track previous core count for authoritative topology detection.
+    last_authoritative_core_count: usize,
 }
 
 impl Sampler {
@@ -68,10 +70,11 @@ impl Sampler {
         notify: SyncSender<()>,
         pending_config: Arc<Mutex<Option<HistoryConfig>>>,
     ) -> Self {
-        let core_count = detect_core_count(&config);
+        let core_ids = detect_core_ids();
+        let (core_ids, _hidden) = normalize_core_ids(&core_ids);
         let gpu_devices = gpu::discover("/sys");
         let gpu_ids: Vec<String> = gpu_devices.iter().map(|d| d.pci_id.clone()).collect();
-        let history = History::new(&config, core_count, &gpu_ids);
+        let history = History::new(&config, &core_ids, &gpu_ids);
 
         Sampler {
             cpu_collector: CpuCollector::new("/proc", "/sys"),
@@ -88,7 +91,8 @@ impl Sampler {
             skipped: 0,
             last_discovery_ns: 0,
             prev_t_boot_ns: None,
-            core_count,
+            core_count: core_ids.len(),
+            last_authoritative_core_count: core_ids.len(),
         }
     }
 
@@ -209,7 +213,7 @@ impl Sampler {
             let sample_dur = sample_start.elapsed();
             self.prev_t_boot_ns = Some(t_boot_ns);
 
-            let snapshot = Snapshot {
+            let mut snapshot = Snapshot {
                 seq: self.seq,
                 t_boot_ns,
                 sample_duration_us: sample_dur.as_micros() as u64,
@@ -228,19 +232,45 @@ impl Sampler {
                 self.history.cpu_total.push(SamplePoint::gap(t_boot_ns));
             }
 
-            // Per-core
-            self.history.cpu_per_core.resize(
-                snapshot.cpu.per_core_percent.len(),
-                Ring::new(self.config.capacity),
-            );
-            for (i, core_pct) in snapshot.cpu.per_core_percent.iter().enumerate() {
-                if i < self.history.cpu_per_core.len() {
-                    match core_pct {
-                        Reading::Value(v) => {
-                            self.history.cpu_per_core[i].push(SamplePoint::new(t_boot_ns, *v))
-                        }
-                        _ => self.history.cpu_per_core[i].push(SamplePoint::gap(t_boot_ns)),
+            // Per-core — keyed by CoreId with gap-not-wipe semantics.
+            // Normalize incoming cores to MAX_CPU_CORES before reconcile.
+            let (normalized_cores, hidden) = normalize_cores(snapshot.cpu.per_core_percent.clone());
+            snapshot.cpu.core_hidden = hidden;
+            // Completeness: permit removal only when the sample includes every
+            // currently online core (read from sysfs), i.e. the sample is an
+            // authoritative snapshot of the full live topology.
+            // Empty samples never permit removal.
+            let online = online_core_ids_normalized();
+            let snap_ids: Vec<CoreId> =
+                normalized_cores.iter().map(|c| c.id).collect();
+            let permit_removal = is_complete_sample(&snap_ids, &online);
+            self.history
+                .reconcile_cores(&self.config, &normalized_cores, permit_removal);
+            if permit_removal {
+                self.last_authoritative_core_count = normalized_cores.len();
+            }
+            self.core_count = self.history.cpu_per_core.len();
+
+            // Push values (or gaps) into each per-core ring
+            for core_reading in &normalized_cores {
+                if let Some((_, ring)) = self
+                    .history
+                    .cpu_per_core
+                    .iter_mut()
+                    .find(|(id, _)| *id == core_reading.id)
+                {
+                    match &core_reading.value {
+                        Reading::Value(v) => ring.push(SamplePoint::new(t_boot_ns, *v)),
+                        _ => ring.push(SamplePoint::gap(t_boot_ns)),
                     }
+                }
+            }
+            // Push gaps for cores in history but missing from this snapshot
+            let snap_ids: std::collections::HashSet<CoreId> =
+                normalized_cores.iter().map(|c| c.id).collect();
+            for (id, ring) in &mut self.history.cpu_per_core {
+                if !snap_ids.contains(id) {
+                    ring.push(SamplePoint::gap(t_boot_ns));
                 }
             }
 
@@ -362,7 +392,7 @@ impl Sampler {
 /// timestamp. Used to mark a discontinuity in the sparklines.
 fn push_gap_to_all_rings(history: &mut History, t_ns: u64) {
     history.cpu_total.push(SamplePoint::gap(t_ns));
-    for ring in &mut history.cpu_per_core {
+    for (_id, ring) in &mut history.cpu_per_core {
         ring.push(SamplePoint::gap(t_ns));
     }
     history.cpu_temp.push(SamplePoint::gap(t_ns));
@@ -382,20 +412,124 @@ fn push_gap_to_all_rings(history: &mut History, t_ns: u64) {
     }
 }
 
-fn detect_core_count(_config: &HistoryConfig) -> usize {
-    // Parse /proc/stat to count cpuN lines
+fn detect_core_ids() -> Vec<CoreId> {
+    // Parse /proc/stat to count cpuN lines and extract their numeric ids.
     let content = std::fs::read_to_string("/proc/stat").unwrap_or_default();
-    let mut count = 0;
+    let mut ids = Vec::new();
     for line in content.lines() {
         if line.starts_with("cpu") && !line.starts_with("cpu ") {
             // Must have a digit after "cpu"
             let rest = &line[3..];
-            if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                count += 1;
+            if let Some(first_char) = rest.chars().next()
+                && first_char.is_ascii_digit()
+            {
+                // Extract the numeric id: everything up to the first space
+                let num_str = rest.split_whitespace().next().unwrap_or("0");
+                if let Ok(n) = num_str.parse::<u32>() {
+                    ids.push(CoreId(n));
+                }
             }
         }
     }
-    count.max(1)
+    if ids.is_empty() {
+        ids.push(CoreId(0));
+    }
+    ids
+}
+
+/// Parse a CPU online range string from sysfs, e.g. "0-15", "0-3,8-11", "7".
+/// Returns a sorted, deduplicated list of CoreIds on success.
+///
+/// Rejects: empty input, reversed ranges, non-numeric tokens, and trailing junk
+/// — every comma-separated part must strictly match `N` or `N-M` with start ≤ end.
+fn parse_cpu_online_ranges(ranges: &str) -> Result<Vec<CoreId>, String> {
+    let input = ranges.trim();
+    if input.is_empty() {
+        return Err("empty cpu online range string".into());
+    }
+
+    let mut ids = Vec::new();
+    for part in input.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(format!(
+                "empty segment in cpu online range: {ranges:?}"
+            ));
+        }
+        if let Some(pos) = part.find('-') {
+            let start_str = part[..pos].trim();
+            let end_str = part[pos + 1..].trim();
+            if start_str.is_empty() || end_str.is_empty() {
+                return Err(format!(
+                    "malformed range segment {part:?} in cpu online range: {ranges:?}"
+                ));
+            }
+            let start = start_str.parse::<u32>().map_err(|_| {
+                format!(
+                    "non-numeric range start {start_str:?} in cpu online range: {ranges:?}"
+                )
+            })?;
+            let end = end_str.parse::<u32>().map_err(|_| {
+                format!(
+                    "non-numeric range end {end_str:?} in cpu online range: {ranges:?}"
+                )
+            })?;
+            if start > end {
+                return Err(format!(
+                    "reversed range {start}-{end} in cpu online range: {ranges:?}"
+                ));
+            }
+            for i in start..=end {
+                ids.push(CoreId(i));
+            }
+        } else {
+            let n = part.parse::<u32>().map_err(|_| {
+                format!(
+                    "non-numeric segment {part:?} in cpu online range: {ranges:?}"
+                )
+            })?;
+            ids.push(CoreId(n));
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Read online CPU ids from sysfs (`/sys/devices/system/cpu/online`).
+///
+/// - File missing or empty → fallback to `/proc/stat` detection.
+/// - File nonempty but unparseable → return empty (treat topology as unknown);
+///   this ensures `is_complete_sample` cannot authorize history-ring removal.
+fn online_core_ids() -> Vec<CoreId> {
+    let content =
+        std::fs::read_to_string("/sys/devices/system/cpu/online").unwrap_or_default();
+    let content = content.trim();
+    if content.is_empty() {
+        return detect_core_ids();
+    }
+    parse_cpu_online_ranges(content).unwrap_or_default()
+}
+
+/// Normalized version: read online cores, sort, clamp to MAX_CPU_CORES.
+fn online_core_ids_normalized() -> Vec<CoreId> {
+    let ids = online_core_ids();
+    let (ids, _hidden) = normalize_core_ids(&ids);
+    ids
+}
+
+/// Determine whether a sample represents a complete topology relative to the
+/// set of online cores. Returns true when the sample is nonempty, the online
+/// set is nonempty, and the sample includes every currently online core —
+/// i.e., the sample is authoritative for deciding which history rings to
+/// retain or remove.
+///
+/// Safety: when online_ids is empty (unparseable sysfs), this always returns
+/// false so a corrupted or missing online file cannot authorize ring removal.
+fn is_complete_sample(snap_ids: &[CoreId], online_ids: &[CoreId]) -> bool {
+    !snap_ids.is_empty()
+        && !online_ids.is_empty()
+        && online_ids.iter().all(|oid| snap_ids.contains(oid))
 }
 
 /// Run a single sample collection for diagnostic modes (--once, --soak).
@@ -624,5 +758,128 @@ mod tests {
         let (next, skips) = advance_deadline(100, 50, 0);
         assert_eq!(next, 50);
         assert_eq!(skips, 0);
+    }
+
+    // ── CPU online range parser ──
+
+    #[test]
+    fn parse_range_single_number() {
+        let ids = parse_cpu_online_ranges("7").unwrap();
+        assert_eq!(ids, vec![CoreId(7)]);
+    }
+
+    #[test]
+    fn parse_range_simple_range() {
+        let ids = parse_cpu_online_ranges("0-3").unwrap();
+        assert_eq!(ids, vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3)]);
+    }
+
+    #[test]
+    fn parse_range_multi_ranges() {
+        let ids = parse_cpu_online_ranges("0-1,4-5").unwrap();
+        assert_eq!(
+            ids,
+            vec![CoreId(0), CoreId(1), CoreId(4), CoreId(5)]
+        );
+    }
+
+    #[test]
+    fn parse_range_single_and_range() {
+        let ids = parse_cpu_online_ranges("0,2-3").unwrap();
+        assert_eq!(
+            ids,
+            vec![CoreId(0), CoreId(2), CoreId(3)]
+        );
+    }
+
+    #[test]
+    fn parse_range_with_whitespace() {
+        let ids = parse_cpu_online_ranges(" 0-2 , 5-6 ").unwrap();
+        assert_eq!(
+            ids,
+            vec![CoreId(0), CoreId(1), CoreId(2), CoreId(5), CoreId(6)]
+        );
+    }
+
+    #[test]
+    fn parse_range_empty_is_error() {
+        // Empty input must be rejected — caller needs to know topology is unknown.
+        assert!(parse_cpu_online_ranges("").is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_bad_token() {
+        // "0-3,bad" must fail entirely, not silently parse as 0-3.
+        assert!(parse_cpu_online_ranges("0-3,bad").is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_reversed_range() {
+        // "5-1" is a reversed range — reject it.
+        assert!(parse_cpu_online_ranges("5-1").is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_empty_segment() {
+        // Trailing comma creates empty segment — reject.
+        assert!(parse_cpu_online_ranges("0-3,").is_err());
+    }
+
+    // ── Completeness check ──
+
+    #[test]
+    fn complete_sample_matches_online() {
+        let snap = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3)];
+        let online = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3)];
+        assert!(is_complete_sample(&snap, &online));
+    }
+
+    #[test]
+    fn sample_has_extra_above_online_is_complete() {
+        // Sample has all online cores plus extras — still complete
+        let snap = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3), CoreId(4)];
+        let online = vec![CoreId(0), CoreId(1)];
+        assert!(is_complete_sample(&snap, &online));
+    }
+
+    #[test]
+    fn partial_sample_missing_online_is_not_complete() {
+        let snap = vec![CoreId(0), CoreId(2)];
+        let online = vec![CoreId(0), CoreId(1), CoreId(2)];
+        assert!(!is_complete_sample(&snap, &online));
+    }
+
+    #[test]
+    fn empty_sample_is_not_complete() {
+        let snap: Vec<CoreId> = vec![];
+        let online = vec![CoreId(0)];
+        assert!(!is_complete_sample(&snap, &online));
+    }
+
+    #[test]
+    fn complete_shrink_sample_covers_smaller_online() {
+        // Legitimate shrink: online went from 8 to 4, sample covers all 4 online
+        let snap = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3)];
+        let online = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3)];
+        assert!(is_complete_sample(&snap, &online));
+        // online has 4, snap covers all 4 → complete (permit_removal = true)
+    }
+
+    #[test]
+    fn ghost_cores_in_sample_but_all_online_present() {
+        // Sample still has ghost cores from old topology, but all online present
+        let snap = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3),
+                        CoreId(4), CoreId(5), CoreId(6), CoreId(7)];
+        let online = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3)];
+        assert!(is_complete_sample(&snap, &online));
+    }
+
+    #[test]
+    fn empty_online_not_complete_even_with_nonempty_sample() {
+        // Safety: when online is empty (unparseable sysfs), a nonempty sample
+        // must NOT authorize ring removal. The topology is unknown.
+        let snap = vec![CoreId(0)];
+        let online: Vec<CoreId> = vec![];
+        assert!(!is_complete_sample(&snap, &online));
     }
 }

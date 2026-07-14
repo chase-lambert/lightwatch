@@ -18,14 +18,14 @@ cargo run --release -- --soak 30 # headless RSS/CPU soak
 | `--once` | | Snapshot to stdout, then exit |
 | `--soak SECS` | | Headless sample loop + summary |
 | `--interval MS` | `1000` | Sample period (100 ms–60 s) |
-| `--history SECS` | `900` | Graph window (≤ 2 h; capacity = window ÷ interval) |
+| `--history SECS` | `60` | Graph window (≤ 2 h; capacity = window ÷ interval) |
 
 Needs a recent stable Rust. GUI wants Wayland or X11. NVIDIA metrics need `libnvidia-ml` (driver package); without it, other panels still work.
 
 ## What it shows
 
-- **CPU** — overall %, temp, freq; history sparkline (per-core bars/graphs: next polish)
-- **Memory / swap** — used ≈ `MemTotal − MemAvailable`, available, swap, load 1/5/15
+- **CPU** — overall %, temp, freq in header; **all logical CPUs** as multi-series overlay chart with stable per-core colors and legend (live % per core). Up to 256 cores supported; palette wraps at 16 colors.
+- **Memory / swap** — dual-series chart (used %, swap %) with grid; stat chips for Used, Avail, Swap, Load 1/5/15
 - **GPUs** — discovered by **PCI address**, not DRM card index  
   - AMD: sysfs (`gpu_busy_percent`, VRAM, hwmon)  
   - NVIDIA: NVML only when sysfs `runtime_status` is **`active`** (fail-closed; will not wake a suspended dGPU)
@@ -87,7 +87,7 @@ Targets (engineering goals, measured honestly):
 | GUI (iced + wgpu) | ~**230 MiB** | Matches system monitor; iced/wgpu baseline dominates. **Above** the 100 MiB aim — known gap for a later pass |
 | Release binary | ~22 MiB | Unstripped |
 
-UI currently wakes on a **250 ms** timer to poll the sampler notify channel (~4 Hz), not pure event-driven repaint. Graphs update at sample cadence (1 Hz by default), so they look stepped next to GNOME’s smoother multi-core charts — intentional MVP tradeoff, not final polish.
+UI currently wakes on a **100 ms** timer to poll the sampler notify channel (~10 Hz). Graphs scroll smoothly via age-based X mapping with `window_end = boottime now` — no collinear densification needed. Sample cadence remains 1 Hz by default.
 
 **Not verified yet:** worst-case publish cost at 100 ms × 7200 points; “dGPU starts suspended and stays suspended with GUI open” on a machine where the dGPU actually autosuspends (compositor often holds it active).
 

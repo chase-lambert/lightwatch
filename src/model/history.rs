@@ -1,6 +1,23 @@
 use super::snapshot::Reading;
 use std::time::Duration;
 
+// ---------------------------------------------------------------------------
+// Shared constants
+// ---------------------------------------------------------------------------
+
+/// Maximum logical CPUs supported (single allocation boundary).
+pub const MAX_CPU_CORES: usize = 256;
+/// Length of the core-color palette.
+pub const CORE_PALETTE_LEN: usize = 16;
+/// Default history window in seconds (1 minute, GSM-style).
+pub const DEFAULT_HISTORY_SECS: u64 = 60;
+/// Default sample interval in milliseconds.
+pub const DEFAULT_INTERVAL_MS: u64 = 1000;
+
+// ---------------------------------------------------------------------------
+// SamplePoint
+// ---------------------------------------------------------------------------
+
 /// A single point in a metric ring: timestamp (boottime nanos) and optional value.
 #[derive(Clone, Copy, Debug)]
 pub struct SamplePoint {
@@ -25,6 +42,58 @@ impl SamplePoint {
 }
 
 // ---------------------------------------------------------------------------
+// CoreId and CoreReading — stable per-core identity
+// ---------------------------------------------------------------------------
+
+/// Stable core identifier: numeric index parsed from `cpuN`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CoreId(pub u32);
+
+impl CoreId {
+    pub fn label(&self) -> String {
+        format!("cpu{}", self.0)
+    }
+}
+
+/// A labeled per-core CPU reading.
+#[derive(Clone, Debug)]
+pub struct CoreReading {
+    pub id: CoreId,
+    pub label: String,
+    pub value: Reading<f32>,
+}
+
+/// Normalize a list of core readings: sort by id, truncate to MAX_CPU_CORES.
+/// Returns the normalized list and the count of hidden cores.
+pub fn normalize_cores(cores: Vec<CoreReading>) -> (Vec<CoreReading>, usize) {
+    let mut sorted = cores;
+    sorted.sort_by_key(|c| c.id);
+    let hidden = if sorted.len() > MAX_CPU_CORES {
+        sorted.len() - MAX_CPU_CORES
+    } else {
+        0
+    };
+    sorted.truncate(MAX_CPU_CORES);
+    debug_assert!(sorted.len() <= MAX_CPU_CORES);
+    (sorted, hidden)
+}
+
+/// Normalize a list of core ids: sort, truncate to MAX_CPU_CORES.
+/// Returns the clamped ids and the count of hidden cores.
+pub fn normalize_core_ids(ids: &[CoreId]) -> (Vec<CoreId>, usize) {
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    let hidden = if sorted.len() > MAX_CPU_CORES {
+        sorted.len() - MAX_CPU_CORES
+    } else {
+        0
+    };
+    sorted.truncate(MAX_CPU_CORES);
+    debug_assert!(sorted.len() <= MAX_CPU_CORES);
+    (sorted, hidden)
+}
+
+// ---------------------------------------------------------------------------
 // HistoryConfig — validated configuration
 // ---------------------------------------------------------------------------
 
@@ -42,12 +111,12 @@ pub struct HistoryConfig {
 }
 
 impl HistoryConfig {
-    /// Default: 1 s interval, 15 min window → 900 capacity.
+    /// Default: 1 s interval, 60 s window → 60 capacity (GSM-aligned).
     pub fn default_config() -> Self {
         Self {
-            interval: Duration::from_secs(1),
-            window: Duration::from_secs(900),
-            capacity: 900,
+            interval: Duration::from_millis(DEFAULT_INTERVAL_MS),
+            window: Duration::from_secs(DEFAULT_HISTORY_SECS),
+            capacity: DEFAULT_HISTORY_SECS as usize,
         }
     }
 
@@ -212,7 +281,8 @@ impl Ring {
 #[derive(Clone, Debug)]
 pub struct History {
     pub cpu_total: Ring,
-    pub cpu_per_core: Vec<Ring>,
+    /// Keyed per-core rings: (CoreId, Ring). Indexed by stable core id, not position.
+    pub cpu_per_core: Vec<(CoreId, Ring)>,
     pub cpu_temp: Ring,
     pub cpu_freq: Ring,
     pub mem_used: Ring,
@@ -235,9 +305,14 @@ pub struct GpuHistory {
 }
 
 impl History {
-    pub fn new(config: &HistoryConfig, core_count: usize, gpu_ids: &[String]) -> Self {
+    /// Create a new History. `core_ids` are the initial core identifiers;
+    /// rings are created for each.
+    pub fn new(config: &HistoryConfig, core_ids: &[CoreId], gpu_ids: &[String]) -> Self {
         let cap = config.capacity;
-        let cpu_per_core: Vec<Ring> = (0..core_count).map(|_| Ring::new(cap)).collect();
+        let cpu_per_core: Vec<(CoreId, Ring)> = core_ids
+            .iter()
+            .map(|&id| (id, Ring::new(cap)))
+            .collect();
         let gpu_series: Vec<GpuHistory> = gpu_ids
             .iter()
             .map(|id| GpuHistory {
@@ -274,7 +349,7 @@ impl History {
         // clone self to try resizing
         let mut candidate = self.clone();
         candidate.cpu_total.try_resize(new_capacity)?;
-        for ring in &mut candidate.cpu_per_core {
+        for (_, ring) in &mut candidate.cpu_per_core {
             ring.try_resize(new_capacity)?;
         }
         candidate.cpu_temp.try_resize(new_capacity)?;
@@ -294,6 +369,49 @@ impl History {
         }
         *self = candidate;
         Ok(())
+    }
+
+    /// Reconcile per-core rings against a normalized core list.
+    ///
+    /// - `permit_removal = true` (authoritative complete topology): remove
+    ///   vanished cores first, then add any new cores from the snapshot.
+    /// - `permit_removal = false` (partial sample): add new cores only when
+    ///   there is room under MAX_CPU_CORES; never remove existing rings.
+    ///   Partial samples must pass `false`.
+    pub fn reconcile_cores(
+        &mut self,
+        config: &HistoryConfig,
+        snapshot_cores: &[CoreReading],
+        permit_removal: bool,
+    ) {
+        let cap = config.capacity;
+
+        if permit_removal {
+            // Authoritative topology: removal first (makes room), then adds.
+            let snap_ids: std::collections::HashSet<CoreId> =
+                snapshot_cores.iter().map(|c| c.id).collect();
+            self.cpu_per_core
+                .retain(|(id, _)| snap_ids.contains(id));
+            for core in snapshot_cores {
+                if !self.cpu_per_core.iter().any(|(id, _)| *id == core.id) {
+                    let ring = Ring::new(cap);
+                    self.cpu_per_core.push((core.id, ring));
+                }
+            }
+        } else {
+            // Partial sample: only add new cores when room remains;
+            // never remove existing rings even if absent from snapshot.
+            for core in snapshot_cores {
+                if !self.cpu_per_core.iter().any(|(id, _)| *id == core.id)
+                    && self.cpu_per_core.len() < MAX_CPU_CORES
+                {
+                    let ring = Ring::new(cap);
+                    self.cpu_per_core.push((core.id, ring));
+                }
+            }
+        }
+
+        debug_assert!(self.cpu_per_core.len() <= MAX_CPU_CORES);
     }
 
     /// Reconcile GPU series: add new GPUs, remove gone ones (keeps matching by pci_id).
@@ -323,7 +441,10 @@ impl History {
 #[derive(Clone, Debug)]
 pub struct CpuSnapshot {
     pub usage_percent: Reading<f32>,
-    pub per_core_percent: Vec<Reading<f32>>,
+    /// Labeled per-core readings with stable CoreId (already normalized).
+    pub per_core_percent: Vec<CoreReading>,
+    /// Number of cores hidden due to MAX_CPU_CORES truncation.
+    pub core_hidden: usize,
     pub temp_celsius: Reading<f32>,
     pub freq_mhz: Reading<f32>,
 }
@@ -448,9 +569,9 @@ mod tests {
     #[test]
     fn history_config_default() {
         let c = HistoryConfig::default_config();
-        assert_eq!(c.capacity, 900);
+        assert_eq!(c.capacity, 60);
         assert_eq!(c.interval, Duration::from_secs(1));
-        assert_eq!(c.window, Duration::from_secs(900));
+        assert_eq!(c.window, Duration::from_secs(60));
     }
 
     #[test]
@@ -502,7 +623,8 @@ mod tests {
     #[test]
     fn history_default_no_reconcile() {
         let config = HistoryConfig::default_config();
-        let hist = History::new(&config, 4, &[]);
+        let core_ids: Vec<CoreId> = (0..4).map(CoreId).collect();
+        let hist = History::new(&config, &core_ids, &[]);
         assert_eq!(hist.cpu_per_core.len(), 4);
         assert_eq!(hist.gpu_series.len(), 0);
     }
@@ -510,7 +632,8 @@ mod tests {
     #[test]
     fn history_reconcile_gpus_add_and_remove() {
         let config = HistoryConfig::default_config();
-        let mut hist = History::new(&config, 2, &["0000:01:00.0".into()]);
+        let core_ids: Vec<CoreId> = (0..2).map(CoreId).collect();
+        let mut hist = History::new(&config, &core_ids, &["0000:01:00.0".into()]);
         assert_eq!(hist.gpu_series.len(), 1);
         hist.reconcile_gpus(&config, &["0000:04:00.0".into()]);
         assert_eq!(hist.gpu_series.len(), 1);
@@ -520,8 +643,303 @@ mod tests {
     #[test]
     fn history_resize_atomic() {
         let config = HistoryConfig::default_config();
-        let mut hist = History::new(&config, 1, &[]);
+        let core_ids = vec![CoreId(0)];
+        let mut hist = History::new(&config, &core_ids, &[]);
         hist.resize(100).unwrap();
         assert_eq!(hist.cpu_total.capacity(), 100);
+    }
+
+    // ── Core identity tests ──
+
+    #[test]
+    fn normalize_cores_sorts_and_truncates() {
+        let cores: Vec<CoreReading> = vec![
+            CoreReading {
+                id: CoreId(5),
+                label: "cpu5".into(),
+                value: Reading::Value(50.0),
+            },
+            CoreReading {
+                id: CoreId(0),
+                label: "cpu0".into(),
+                value: Reading::Value(10.0),
+            },
+            CoreReading {
+                id: CoreId(2),
+                label: "cpu2".into(),
+                value: Reading::Value(30.0),
+            },
+        ];
+        let (norm, hidden) = normalize_cores(cores);
+        assert_eq!(hidden, 0);
+        assert_eq!(norm.len(), 3);
+        assert_eq!(norm[0].id, CoreId(0));
+        assert_eq!(norm[1].id, CoreId(2));
+        assert_eq!(norm[2].id, CoreId(5));
+    }
+
+    #[test]
+    fn normalize_cores_clamps_to_max() {
+        let cores: Vec<CoreReading> = (0..260)
+            .map(|i| CoreReading {
+                id: CoreId(i),
+                label: format!("cpu{i}"),
+                value: Reading::Value(0.0),
+            })
+            .collect();
+        assert_eq!(cores.len(), 260);
+        let (norm, hidden) = normalize_cores(cores);
+        assert_eq!(norm.len(), 256);
+        assert_eq!(hidden, 4);
+    }
+
+    #[test]
+    fn normalize_core_ids_sorts_and_truncates() {
+        let ids = vec![CoreId(300), CoreId(0), CoreId(5), CoreId(2)];
+        let (norm, hidden) = normalize_core_ids(&ids);
+        assert_eq!(hidden, 0);
+        assert_eq!(norm.len(), 4);
+        assert_eq!(norm[0], CoreId(0));
+        assert_eq!(norm[1], CoreId(2));
+        assert_eq!(norm[2], CoreId(5));
+        assert_eq!(norm[3], CoreId(300));
+    }
+
+    #[test]
+    fn normalize_core_ids_clamps_to_max() {
+        let ids: Vec<CoreId> = (0..260).map(CoreId).collect();
+        assert_eq!(ids.len(), 260);
+        let (norm, hidden) = normalize_core_ids(&ids);
+        assert_eq!(norm.len(), 256);
+        assert_eq!(hidden, 4);
+    }
+
+    #[test]
+    fn reconcile_cores_adds_new_preserves_existing() {
+        let config = HistoryConfig::default_config();
+        let initial = vec![CoreId(0), CoreId(1)];
+        let mut hist = History::new(&config, &initial, &[]);
+        assert_eq!(hist.cpu_per_core.len(), 2);
+
+        let snap = vec![
+            CoreReading {
+                id: CoreId(0),
+                label: "cpu0".into(),
+                value: Reading::Value(10.0),
+            },
+            CoreReading {
+                id: CoreId(1),
+                label: "cpu1".into(),
+                value: Reading::Value(20.0),
+            },
+            CoreReading {
+                id: CoreId(2),
+                label: "cpu2".into(),
+                value: Reading::Value(30.0),
+            },
+        ];
+        hist.reconcile_cores(&config, &snap, true);
+        // should now have 3 cores (adds cpu2, keeps existing)
+        assert_eq!(hist.cpu_per_core.len(), 3);
+        // new ring must be empty — no fabricated t=0 sample
+        let (_, ring2) = hist
+            .cpu_per_core
+            .iter()
+            .find(|(id, _)| *id == CoreId(2))
+            .expect("cpu2 should exist");
+        assert_eq!(ring2.len(), 0, "new ring must be empty, no t=0 sample");
+    }
+
+    #[test]
+    fn reconcile_cores_removes_when_permitted() {
+        let config = HistoryConfig::default_config();
+        let initial = vec![CoreId(0), CoreId(1), CoreId(2)];
+        let mut hist = History::new(&config, &initial, &[]);
+        assert_eq!(hist.cpu_per_core.len(), 3);
+
+        let snap = vec![CoreReading {
+            id: CoreId(0),
+            label: "cpu0".into(),
+            value: Reading::Value(10.0),
+        }];
+        hist.reconcile_cores(&config, &snap, true);
+        assert_eq!(hist.cpu_per_core.len(), 1);
+        assert_eq!(hist.cpu_per_core[0].0, CoreId(0));
+    }
+
+    #[test]
+    fn reconcile_cores_no_removal_when_not_permitted() {
+        let config = HistoryConfig::default_config();
+        let initial = vec![CoreId(0), CoreId(1), CoreId(2)];
+        let mut hist = History::new(&config, &initial, &[]);
+
+        let snap = vec![CoreReading {
+            id: CoreId(0),
+            label: "cpu0".into(),
+            value: Reading::Value(10.0),
+        }];
+        // partial sample — don't remove
+        hist.reconcile_cores(&config, &snap, false);
+        assert_eq!(hist.cpu_per_core.len(), 3);
+    }
+
+    #[test]
+    fn reconcile_cores_empty_twice_does_not_remove_rings() {
+        // Regression: old bug tracked prev_core_count (became 0 after one
+        // empty) and `0 >= 0` would permit removal on the second empty sample.
+        let config = HistoryConfig::default_config();
+        let initial = vec![CoreId(0), CoreId(1), CoreId(2)];
+        let mut hist = History::new(&config, &initial, &[]);
+        assert_eq!(hist.cpu_per_core.len(), 3);
+
+        let empty: Vec<CoreReading> = vec![];
+        // First empty sample: no removal (empty → permit_removal = false)
+        hist.reconcile_cores(&config, &empty, false);
+        assert_eq!(hist.cpu_per_core.len(), 3);
+        // Second empty sample: still no removal
+        hist.reconcile_cores(&config, &empty, false);
+        assert_eq!(hist.cpu_per_core.len(), 3);
+    }
+
+    #[test]
+    fn reconcile_cores_partial_smaller_without_authority_does_not_remove() {
+        // A partial nonempty sample (fewer cores than last authoritative count)
+        // must not remove rings. Only a complete/authoritative topology can remove.
+        let config = HistoryConfig::default_config();
+        let initial = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3)];
+        let mut hist = History::new(&config, &initial, &[]);
+        assert_eq!(hist.cpu_per_core.len(), 4);
+
+        // Partial sample: only 2 of 4 cores
+        let partial = vec![
+            CoreReading {
+                id: CoreId(0),
+                label: "cpu0".into(),
+                value: Reading::Value(10.0),
+            },
+            CoreReading {
+                id: CoreId(1),
+                label: "cpu1".into(),
+                value: Reading::Value(20.0),
+            },
+        ];
+        // permit_removal=false: partial, not authoritative
+        hist.reconcile_cores(&config, &partial, false);
+        assert_eq!(
+            hist.cpu_per_core.len(),
+            4,
+            "partial sample must not remove rings"
+        );
+    }
+
+    #[test]
+    fn reconcile_cores_new_core_ring_empty_then_real_push() {
+        // Bug fix: new rings must be empty on insert; the worker pushes the
+        // real timestamped sample afterward. No fabricated t=0 point.
+        let config = HistoryConfig::default_config();
+        let initial = vec![CoreId(0)];
+        let mut hist = History::new(&config, &initial, &[]);
+
+        let snap = vec![
+            CoreReading {
+                id: CoreId(0),
+                label: "cpu0".into(),
+                value: Reading::Value(10.0),
+            },
+            CoreReading {
+                id: CoreId(1),
+                label: "cpu1".into(),
+                value: Reading::Value(50.0),
+            },
+        ];
+        hist.reconcile_cores(&config, &snap, true);
+        assert_eq!(hist.cpu_per_core.len(), 2);
+
+        // New ring must be empty
+        let (_, ring1) = hist
+            .cpu_per_core
+            .iter()
+            .find(|(id, _)| *id == CoreId(1))
+            .expect("cpu1 should exist");
+        assert_eq!(ring1.len(), 0, "new ring must start empty");
+
+        // Simulate worker pushing the real timestamped sample
+        let (_id, ring1_mut) = hist
+            .cpu_per_core
+            .iter_mut()
+            .find(|(id, _)| *id == CoreId(1))
+            .unwrap();
+        let real_t = 42_000_000_000u64;
+        ring1_mut.push(SamplePoint::new(real_t, 50.0));
+        assert_eq!(ring1_mut.len(), 1);
+        let pts = ring1_mut.points();
+        assert_eq!(pts[0].t_boot_ns, real_t);
+        assert_eq!(pts[0].value, Some(50.0));
+    }
+
+    #[test]
+    fn reconcile_cores_full_no_new_without_removal() {
+        // 256 retained rings + partial sample with new CoreId + permit_removal=false
+        // → must not exceed MAX_CPU_CORES; new id is skipped.
+        let config = HistoryConfig::default_config();
+        let initial: Vec<CoreId> = (0..MAX_CPU_CORES as u32).map(CoreId).collect();
+        let mut hist = History::new(&config, &initial, &[]);
+        assert_eq!(hist.cpu_per_core.len(), MAX_CPU_CORES);
+
+        // Partial sample: include only cpu0 and a brand new cpu256
+        let partial = vec![
+            CoreReading {
+                id: CoreId(0),
+                label: "cpu0".into(),
+                value: Reading::Value(10.0),
+            },
+            CoreReading {
+                id: CoreId(256),
+                label: "cpu256".into(),
+                value: Reading::Value(50.0),
+            },
+        ];
+        hist.reconcile_cores(&config, &partial, false);
+        assert_eq!(
+            hist.cpu_per_core.len(),
+            MAX_CPU_CORES,
+            "must not exceed MAX_CPU_CORES when adding without removal"
+        );
+        // cpu256 must not have been inserted
+        assert!(
+            !hist.cpu_per_core.iter().any(|(id, _)| *id == CoreId(256)),
+            "new id must be skipped when already at MAX_CPU_CORES"
+        );
+    }
+
+    #[test]
+    fn reconcile_cores_removal_first_makes_room_then_adds() {
+        // When permit_removal=true, removal happens first, making room for
+        // new cores that replace old ones (e.g., topology change 0-7 → 8-15).
+        let config = HistoryConfig::default_config();
+        let initial: Vec<CoreId> = (0..8).map(CoreId).collect();
+        let mut hist = History::new(&config, &initial, &[]);
+        assert_eq!(hist.cpu_per_core.len(), 8);
+
+        // Complete topology sample: ids 4-11 (4 old, 4 new)
+        let snap: Vec<CoreReading> = (4..12)
+            .map(|i| CoreReading {
+                id: CoreId(i),
+                label: format!("cpu{i}"),
+                value: Reading::Value(0.0),
+            })
+            .collect();
+        hist.reconcile_cores(&config, &snap, true);
+        assert_eq!(hist.cpu_per_core.len(), 8);
+        // Old cores 0-3 should have been removed, 8-11 added
+        let ids: Vec<CoreId> = hist
+            .cpu_per_core
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(!ids.contains(&CoreId(0)));
+        assert!(!ids.contains(&CoreId(3)));
+        assert!(ids.contains(&CoreId(10)));
+        assert!(ids.contains(&CoreId(11)));
     }
 }

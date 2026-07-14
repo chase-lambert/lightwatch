@@ -78,6 +78,7 @@ mod tests {
                 cpu: CpuSnapshot {
                     usage_percent: crate::model::Reading::Unavailable { reason: "test" },
                     per_core_percent: vec![],
+                    core_hidden: 0,
                     temp_celsius: crate::model::Reading::Unavailable { reason: "test" },
                     freq_mhz: crate::model::Reading::Unavailable { reason: "test" },
                 },
@@ -101,7 +102,7 @@ mod tests {
                     ticks_skipped: 0,
                 },
             },
-            history: History::new(&HistoryConfig::default_config(), 0, &[]),
+            history: History::new(&HistoryConfig::default_config(), &[], &[]),
         })
     }
 
