@@ -1,8 +1,6 @@
 # lightwatch
 
-A native Linux system monitor you can leave open.
-
-Not a clone of GNOME System Monitor. The point is **restraint**: flat memory by design, low idle CPU, bounded history, and a self strip that always shows lightwatch’s own cost.
+A Linux system monitor built for leaving open. I like to keep my system monitor open continuously but the one that came with my distro had an occasional memory leak so I figured this was a good excuse to learn [Iced](https://iced.rs).
 
 Rust + [iced](https://iced.rs). Linux only. MIT.
 
