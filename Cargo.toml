@@ -1,0 +1,15 @@
+[package]
+name = "lightwatch"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+iced = { version = "0.14", features = ["tokio", "canvas"] }
+clap = { version = "4", features = ["derive"] }
+nvml-wrapper = "0.12"
+libc = "0.2"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

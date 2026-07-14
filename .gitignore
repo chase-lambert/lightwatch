@@ -1,0 +1,6 @@
+/target
+/plans/
+**/*.rs.bk
+*.swp
+*.swo
+.DS_Store
