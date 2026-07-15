@@ -101,6 +101,9 @@ pub const MIN_INTERVAL_MS: u64 = 100;
 pub const MAX_INTERVAL_MS: u64 = 60_000;
 pub const MAX_WINDOW_SECS: u64 = 7200; // 2 hours
 pub const MAX_POINTS_PER_SERIES: usize = 7200;
+/// Keep 2 extra samples beyond the visible window so the left edge can slide
+/// smoothly under the clip rect (anchor for monotone-cubic incoming slope).
+pub const EDGE_GUARD: usize = 2;
 
 /// Validated history configuration. Can only be constructed via `validate()`.
 #[derive(Clone, Debug, PartialEq)]
@@ -111,12 +114,13 @@ pub struct HistoryConfig {
 }
 
 impl HistoryConfig {
-    /// Default: 1 s interval, 60 s window → 60 capacity (GSM-aligned).
+    /// Default: 1 s interval, 60 s window → 60 base + 2 edge-guard = 62 capacity.
     pub fn default_config() -> Self {
+        let base = DEFAULT_HISTORY_SECS as usize;
         Self {
             interval: Duration::from_millis(DEFAULT_INTERVAL_MS),
             window: Duration::from_secs(DEFAULT_HISTORY_SECS),
-            capacity: DEFAULT_HISTORY_SECS as usize,
+            capacity: base + EDGE_GUARD,
         }
     }
 
@@ -156,15 +160,18 @@ impl HistoryConfig {
 
         // 3. capacity
         let capacity_f = window.as_secs_f64() / interval.as_secs_f64();
-        let capacity = capacity_f.floor() as usize;
-        if capacity == 0 {
+        let base_capacity = capacity_f.floor() as usize;
+        if base_capacity == 0 {
             return Err("capacity must be >= 1".into());
         }
-        if capacity > MAX_POINTS_PER_SERIES {
+        if base_capacity > MAX_POINTS_PER_SERIES {
             return Err(format!(
-                "capacity {capacity} exceeds maximum {MAX_POINTS_PER_SERIES}"
+                "capacity {base_capacity} exceeds maximum {MAX_POINTS_PER_SERIES}"
             ));
         }
+        // Add edge-guard samples for smooth left-edge animation under clip.
+        // Guard storage is allowed to exceed the ceiling — see EDGE_GUARD docs.
+        let capacity = base_capacity + EDGE_GUARD;
 
         Ok(Self {
             interval,
@@ -569,7 +576,7 @@ mod tests {
     #[test]
     fn history_config_default() {
         let c = HistoryConfig::default_config();
-        assert_eq!(c.capacity, 60);
+        assert_eq!(c.capacity, 62);
         assert_eq!(c.interval, Duration::from_secs(1));
         assert_eq!(c.window, Duration::from_secs(60));
     }
@@ -615,9 +622,18 @@ mod tests {
     #[test]
     fn history_config_accept_valid() {
         let c = HistoryConfig::validate(1000, 60).unwrap();
-        assert_eq!(c.capacity, 60);
+        assert_eq!(c.capacity, 62);
         assert_eq!(c.interval, Duration::from_millis(1000));
         assert_eq!(c.window, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn history_config_7200_boundary_with_guard() {
+        // 1s interval, 7200s window → base = 7200 (at ceiling), capacity = 7202.
+        let c = HistoryConfig::validate(1000, 7200).unwrap();
+        assert_eq!(c.capacity, 7202);
+        assert_eq!(c.interval, Duration::from_millis(1000));
+        assert_eq!(c.window, Duration::from_secs(7200));
     }
 
     #[test]

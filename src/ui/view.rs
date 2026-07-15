@@ -118,15 +118,11 @@ pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
             let window_secs = preset.window_secs();
             match HistoryConfig::validate(interval_ms, window_secs) {
                 Ok(new_config) => {
-                    // Only commit the preset selection after validation passes.
                     app.selected_preset = preset;
                     *app.pending_config.lock().unwrap() = Some(new_config.clone());
                     app.config = new_config;
                 }
-                Err(_) => {
-                    // Validation failed: keep previous config and preset.
-                    // The button highlight stays on the old (working) preset.
-                }
+                Err(_) => {}
             }
             iced::Task::none()
         }
@@ -208,36 +204,54 @@ pub fn theme(_app: &Lightwatch) -> Theme {
 }
 
 // ---------------------------------------------------------------------------
+// panel helper — surface card with border, rounded corners, padding
+// ---------------------------------------------------------------------------
+
+fn panel<'a>(
+    header: Element<'a, Message>,
+    body: Element<'a, Message>,
+) -> Element<'a, Message> {
+    container(column![header, body].spacing(4))
+        .padding(8)
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(theme::SURFACE)),
+            border: iced::Border {
+                color: theme::BORDER,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+// ---------------------------------------------------------------------------
 // Section builders
 // ---------------------------------------------------------------------------
 
 fn self_strip(snap: &Snapshot) -> Element<'static, Message> {
     let selfm = &snap.self_metrics;
     let rss = rfmt(&selfm.rss_kb, |v| {
-        format!("{:.1} MiB RSS", *v as f64 / 1024.0)
+        format!("{:.1} MiB", *v as f64 / 1024.0)
     });
-    let cpu = rfmt(&selfm.cpu_percent, |v| format!("{v:.1}% self"));
+    let cpu = rfmt(&selfm.cpu_percent, |v| format!("{v:.1}%"));
     let dur = format!("{}us", snap.sample_duration_us);
 
     let items = row![
-        text("lightwatch").size(13).color(theme::ACCENT_SELF),
+        text("lightwatch")
+            .size(11)
+            .color(theme::with_alpha(theme::ACCENT_SELF, 0.7)),
         Space::new().width(Length::Fill),
-        text(dur).size(11).color(theme::TEXT_DIM),
+        text(dur).size(10).color(theme::TEXT_DIM),
         Space::new().width(8),
-        text(rss).size(11).color(theme::TEXT),
+        text(rss).size(10).color(theme::with_alpha(theme::TEXT, 0.6)),
         Space::new().width(12),
-        text(cpu).size(11).color(theme::TEXT),
+        text(cpu).size(10).color(theme::with_alpha(theme::TEXT, 0.6)),
     ]
     .align_y(Alignment::Center)
     .spacing(0);
 
-    container(items)
-        .padding(4)
-        .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(theme::SURFACE)),
-            ..Default::default()
-        })
-        .into()
+    container(items).padding(4).into()
 }
 
 fn cpu_section(
@@ -248,7 +262,7 @@ fn cpu_section(
 ) -> Element<'static, Message> {
     let cpu = &snap.cpu;
     let usage = rfmt(&cpu.usage_percent, |v| format!("{v:.1}%"));
-    let temp = rfmt_opt(&cpu.temp_celsius, |v| format!("{v:.1} C"));
+    let temp = rfmt_opt(&cpu.temp_celsius, |v| format!("{v:.1}°C"));
     let freq = rfmt_opt(&cpu.freq_mhz, |v| format!("{v:.0} MHz"));
 
     let core_count = format!("{} core(s)", hist.cpu_per_core.len());
@@ -268,19 +282,22 @@ fn cpu_section(
         Space::new().width(12),
         text(freq).size(12).color(theme::TEXT),
         Space::new().width(Length::Fill),
-        text(format!("{}{}", core_count, hidden_text)).size(11).color(theme::TEXT_DIM),
+        text(format!("{}{}", core_count, hidden_text))
+            .size(11)
+            .color(theme::TEXT_DIM),
     ]
     .align_y(Alignment::Center);
 
-    // Build multi-core overlay chart
-    let mut chart = MultiChart::new(false); // no grid for CPU multi-core
+    // Build multi-core overlay chart (hairball with per-line alpha)
+    let mut chart = MultiChart::new(true); // enable decimation for CPU
     for (core_id, ring) in &hist.cpu_per_core {
         let color = theme::core_color(core_id.0);
         chart.series.push(SeriesData {
             points: ring.points(),
             color,
             max_value: 100.0,
-            fill: false, // no fill for multi-core overlay
+            fill: false,
+            line_alpha: Some(0.80),
         });
     }
     chart.window = DrawWindow {
@@ -292,34 +309,43 @@ fn cpu_section(
         .width(Length::Fill)
         .height(Length::Fixed(180.0));
 
-    // Legend: colored chips with label and current percentage
-    let legend_items: Vec<Element<Message>> = hist
-        .cpu_per_core
-        .iter()
-        .map(|(core_id, _ring)| {
-            // Prefer current snapshot reading for this CoreId; show — if gap/unavailable.
-            let pct_str = snap
-                .cpu
-                .per_core_percent
-                .iter()
-                .find(|cr| cr.id == *core_id)
-                .and_then(|cr| match &cr.value {
-                    Reading::Value(v) => Some(format!("{:3.0}%", v)),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "  —".to_string());
-            let color = theme::core_color(core_id.0);
-            let label = format!("{} {}", core_id.label(), pct_str);
-            legend_chip(&label, color)
-        })
-        .collect();
+    // Legend: 4 columns below the chart (GSM-style)
+    let cores = &hist.cpu_per_core;
+    let n = cores.len();
+    let per_col = n.div_ceil(4).max(1);
 
-    let legend = column(legend_items).spacing(1);
+    let mut legend_cols: Vec<Element<Message>> = Vec::with_capacity(4);
+    for col_idx in 0..4 {
+        let start = col_idx * per_col;
+        let end = ((col_idx + 1) * per_col).min(n);
+        if start >= n {
+            break;
+        }
+        let items: Vec<Element<Message>> = cores[start..end]
+            .iter()
+            .map(|(core_id, _ring)| {
+                let pct_str = snap
+                    .cpu
+                    .per_core_percent
+                    .iter()
+                    .find(|cr| cr.id == *core_id)
+                    .and_then(|cr| match &cr.value {
+                        Reading::Value(v) => Some(format!("{:3.0}%", v)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "  —".to_string());
+                let color = theme::core_color(core_id.0);
+                let label = format!("{} {}", core_id.label(), pct_str);
+                legend_chip(&label, color)
+            })
+            .collect();
+        legend_cols.push(column(items).spacing(1).into());
+    }
 
-    column![header, canvas, legend]
-        .spacing(4)
-        .padding(4)
-        .into()
+    let legend = row(legend_cols).spacing(16);
+
+    // Wrap in a panel card
+    panel(header.into(), column![canvas, legend].spacing(4).into())
 }
 
 fn memory_section(
@@ -348,26 +374,28 @@ fn memory_section(
 
     // Stats chips
     let stats = row![
-        stat_box("Used".into(), used, theme::ACCENT_MEM),
+        stat_box("Used", used, theme::ACCENT_MEM),
         Space::new().width(6),
-        stat_box("Avail".into(), avail, theme::ACCENT_MEM),
+        stat_box("Avail", avail, theme::ACCENT_MEM),
         Space::new().width(6),
-        stat_box("Swap".into(), swap, theme::ACCENT_SWAP),
+        stat_box("Swap", swap, theme::ACCENT_SWAP),
         Space::new().width(6),
-        stat_box("Load".into(), load, theme::ACCENT_LOAD),
+        stat_box("Load", load, theme::ACCENT_LOAD),
     ]
     .spacing(0);
 
-    // Dual-series chart: mem used (with fill) + swap used (stroke only)
-    let mut chart = MultiChart::new(true); // grid for memory
+    // Dual-series chart: mem used (with fill) + swap used (stroke only).
+    // Both normalize to percent of their own pool (max_value = pool size in KB);
+    // the Y axis shows 0–100% uniformly (KD7).
+    let mut chart = MultiChart::new(false); // no decimation for two series
     chart.series.push(SeriesData {
         points: hist.mem_used.points(),
         color: theme::ACCENT_MEM,
         max_value: max_mem.max(1.0),
         fill: true,
+        line_alpha: None,
     });
 
-    // Only add swap series if swap total > 0
     if let Reading::Value(swap_total) = mem.swap_total_kb
         && swap_total > 0
     {
@@ -376,6 +404,7 @@ fn memory_section(
             color: theme::ACCENT_SWAP,
             max_value: swap_total as f32,
             fill: false,
+            line_alpha: None,
         });
     }
 
@@ -386,12 +415,14 @@ fn memory_section(
 
     let canvas = Canvas::new(chart)
         .width(Length::Fill)
-        .height(Length::Fixed(110.0));
+        .height(Length::Fixed(120.0));
 
-    column![section_label("Memory"), stats, canvas]
-        .spacing(4)
-        .padding(4)
-        .into()
+    // Header: section label
+    let header = section_label("Memory");
+
+    let body = column![stats, canvas].spacing(4);
+
+    panel(header, body.into())
 }
 
 fn gpu_section(
@@ -412,34 +443,34 @@ fn gpu_section(
         }
         _ => "--".into(),
     };
-    let temp = rfmt_opt(&gpu.temp_celsius, |v| format!("{v:.1} C"));
+    let temp = rfmt_opt(&gpu.temp_celsius, |v| format!("{v:.1}°C"));
     let power = rfmt_opt(&gpu.power_watts, |v| format!("{v:.1} W"));
 
-    // GPU title: "{name} -- {pci}"
     let title = format!("{} -- {}", gpu.name, gpu.pci_id);
 
     let stats = row![
-        stat_box("Util".into(), util, theme::ACCENT_GPU),
+        stat_box("Util", util, theme::ACCENT_GPU),
         Space::new().width(6),
-        stat_box("VRAM".into(), vram, theme::ACCENT_GPU),
+        stat_box("VRAM", vram, theme::ACCENT_GPU),
         Space::new().width(6),
-        stat_box("Temp".into(), temp, theme::ACCENT_TEMP),
+        stat_box("Temp", temp, theme::ACCENT_TEMP),
         Space::new().width(6),
-        stat_box("Power".into(), power, theme::ACCENT_WARN),
+        stat_box("Power", power, theme::ACCENT_WARN),
     ]
     .spacing(0);
 
-    let mut content = column![text(title).size(13).color(theme::TEXT), stats]
-        .spacing(4)
-        .padding(4);
+    let header = text(title).size(13).color(theme::TEXT);
+
+    let mut body = column![stats].spacing(4);
 
     if let Some(gh) = gpu_hist {
-        let mut chart = MultiChart::new(true);
+        let mut chart = MultiChart::new(false);
         chart.series.push(SeriesData {
             points: gh.util.points(),
             color: theme::ACCENT_GPU,
             max_value: 100.0,
             fill: true,
+            line_alpha: None,
         });
         chart.window = DrawWindow {
             window_secs,
@@ -449,10 +480,13 @@ fn gpu_section(
         let canvas = Canvas::new(chart)
             .width(Length::Fill)
             .height(Length::Fixed(80.0));
-        content = content.push(canvas);
+        body = body.push(canvas);
     }
 
-    content.into()
+    panel(
+        header.into(),
+        body.into(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +494,10 @@ fn gpu_section(
 // ---------------------------------------------------------------------------
 
 fn section_label(text_str: &str) -> Element<'static, Message> {
-    text(text_str.to_owned()).size(13).color(theme::TEXT).into()
+    text(text_str.to_owned())
+        .size(13)
+        .color(theme::TEXT)
+        .into()
 }
 
 fn rfmt<T: std::fmt::Display>(r: &Reading<T>, f: impl FnOnce(&T) -> String) -> String {
@@ -481,10 +518,10 @@ fn rstr<T: std::fmt::Display>(r: &Reading<T>) -> String {
     }
 }
 
-fn stat_box(label: String, value: String, color: Color) -> Element<'static, Message> {
+fn stat_box(label: &str, value: String, color: Color) -> Element<'static, Message> {
     container(
         column![
-            text(label).size(10).color(theme::TEXT_DIM),
+            text(label.to_owned()).size(10).color(theme::TEXT_DIM),
             text(value).size(13).color(color),
         ]
         .spacing(1),
@@ -500,13 +537,16 @@ fn stat_box(label: String, value: String, color: Color) -> Element<'static, Mess
 /// A small colored legend chip: a color square + label.
 fn legend_chip(label: &str, color: Color) -> Element<'static, Message> {
     let label_owned = label.to_owned();
-    // Use a tiny container as color swatch
     let swatch = container(Space::new().width(8).height(8))
         .style(move |_theme| container::Style {
             background: Some(iced::Background::Color(color)),
             ..Default::default()
         });
-    row![swatch, Space::new().width(4), text(label_owned).size(10).color(theme::TEXT_DIM),]
-        .align_y(Alignment::Center)
-        .into()
+    row![
+        swatch,
+        Space::new().width(4),
+        text(label_owned).size(10).color(theme::TEXT_DIM),
+    ]
+    .align_y(Alignment::Center)
+    .into()
 }
