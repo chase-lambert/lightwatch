@@ -129,19 +129,14 @@ fn draw_multi_chart(frame: &mut Frame, chart: &MultiChart, size: Size) {
     let label_size: f32 = 10.0;
     let axis_color = theme::AXIS_LABEL;
 
-    // ---- 1. Draw grid lines + Y labels + X ticks (outside clip) ---------
-    // Grid (horizontal lines at 25%, 50%, 75%)
-    let grid_ys = graph_geom::compute_grid_y(&bounds);
-    let grid_stroke = Stroke::default()
-        .with_color(theme::GRID)
-        .with_width(0.5);
-    for y in grid_ys {
-        let path = Path::line(
-            pt(bounds.left, y),
-            pt(bounds.right, y),
-        );
-        frame.stroke(&path, grid_stroke);
-    }
+    // ---- 1. Axis labels + tick positions (outside clip) -----------------
+    // Compute time ticks once — used for both vertical gridlines and axis labels.
+    let x_ticks = graph_geom::compute_time_ticks(
+        chart.window.window_secs,
+        bounds.left,
+        bounds.right,
+        chart.window.window_end_ns,
+    );
 
     // Y-axis labels (0% … 100% in the left gutter)
     let y_ticks = graph_geom::compute_y_ticks(&bounds);
@@ -156,12 +151,6 @@ fn draw_multi_chart(frame: &mut Frame, chart: &MultiChart, size: Size) {
     }
 
     // X-axis time ticks (bottom gutter)
-    let x_ticks = graph_geom::compute_time_ticks(
-        chart.window.window_secs,
-        bounds.left,
-        bounds.right,
-        chart.window.window_end_ns,
-    );
     for (x_pos, label) in &x_ticks {
         // Edge-align the boundary ticks so "now" (at plot_right) and the oldest
         // label (at plot_left) don't overflow the gutter and get clipped.
@@ -182,8 +171,33 @@ fn draw_multi_chart(frame: &mut Frame, chart: &MultiChart, size: Size) {
         });
     }
 
-    // ---- 2. Clipped: fills + series curves ------------------------------
+    // ---- 2. Clipped: plot bg, grid, fills + series -----------------------
+    // Plot fill MUST live inside with_clip with the series. iced pastes
+    // clipped meshes first, then flushes the parent frame's buffers — a
+    // parent-level solid fill would paint over every series mesh.
     frame.with_clip(plot_rect, |clipped| {
+        clipped.fill(
+            &Path::rectangle(plot_rect.position(), plot_rect.size()),
+            theme::PLOT_BG,
+        );
+
+        // Grid (horizontal at 25/50/75%, vertical at interior time ticks)
+        let grid_ys = graph_geom::compute_grid_y(&bounds);
+        let grid_stroke = Stroke::default()
+            .with_color(theme::GRID)
+            .with_width(0.5);
+        for y in grid_ys {
+            let path = Path::line(pt(bounds.left, y), pt(bounds.right, y));
+            clipped.stroke(&path, grid_stroke);
+        }
+        for (x, _) in &x_ticks {
+            if (*x - bounds.left).abs() < 1.0 || (*x - bounds.right).abs() < 1.0 {
+                continue;
+            }
+            let path = Path::line(pt(*x, bounds.top), pt(*x, bounds.bottom));
+            clipped.stroke(&path, grid_stroke);
+        }
+
         for series in chart.series.iter() {
             let geom = graph_geom::compute_series(
                 &series.points,

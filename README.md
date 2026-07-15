@@ -22,6 +22,21 @@ cargo run --release -- --soak 30 # headless RSS/CPU soak
 
 Needs a recent stable Rust. GUI wants Wayland or X11. NVIDIA metrics need `libnvidia-ml` (driver package); without it, other panels still work.
 
+## GPU power posture (iGPU default)
+
+Lightwatch pins its UI compositor (iced/wgpu) to the integrated GPU by default so the GUI does not wake a suspended or idle discrete GPU:
+
+- On startup, if **neither** `WGPU_POWER_PREF` nor `VK_ICD_FILENAMES` is already set in the environment, lightwatch sets both:
+  - `WGPU_POWER_PREF=low` (soft wgpu adapter preference), and
+  - `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json` (hard ICD filter; only set when the radeon ICD file exists).
+- If you set **either** env var yourself (including `WGPU_POWER_PREF=high`), lightwatch leaves both alone — you are in full control. Set both to override completely (e.g., force NVIDIA), or unset both to get the automatic iGPU default.
+- The hard bar: with the default bundle applied, the lightwatch process holds **zero** `/dev/nvidia*` file descriptors and the UI renders on the AMD GPU. NVIDIA metrics remain gated (fail-closed on suspend) whether the dGPU is active or not.
+- On machines with a broken radv install, the `VK_ICD_FILENAMES` filter can prevent iced from finding an adapter at all. Simply unsetting `VK_ICD_FILENAMES` with `env -u` is not enough — both vars would then be absent and the default bundle would fire again on next launch. Recovery: set **either** env var to a present value (disabling the whole atomic bundle) **and** clear any stale `VK_ICD_FILENAMES` from a prior launch, e.g.:  
+  `WGPU_POWER_PREF=low env -u VK_ICD_FILENAMES cargo run --release`  
+  (or `WGPU_POWER_PREF=high`, or set `VK_ICD_FILENAMES` to a full ICD list). WGPU and the system ICD loader will then enumerate adapters normally.
+
+Whether the dGPU actually reaches `runtime_status=suspended` while lightwatch is open depends on the platform and PRIME configuration — zero Nvidia FDs from lightwatch is the hard guarantee; card1 suspend is best-effort.
+
 ## What it shows
 
 - **CPU** — overall %, temp, freq in header; **all logical CPUs** as multi-series overlay chart with stable per-core colors and legend (live % per core). Up to 256 cores supported; palette wraps at 16 colors.

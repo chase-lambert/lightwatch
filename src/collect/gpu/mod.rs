@@ -87,6 +87,16 @@ pub fn discover(sys_root: &str) -> Vec<GpuDevice> {
         });
     }
 
+    // Stable sort: AMD/vendor 1002 first, then by pci_id.
+    // Shared order for UI display, --once, and soak.
+    devices.sort_by(|a, b| {
+        let a_amd = a.vendor_id == "1002" || a.driver == "amdgpu";
+        let b_amd = b.vendor_id == "1002" || b.driver == "amdgpu";
+        b_amd
+            .cmp(&a_amd)
+            .then_with(|| a.pci_id.cmp(&b.pci_id))
+    });
+
     devices
 }
 
@@ -120,4 +130,59 @@ fn find_device_hwmon(device_path: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::GpuDevice;
+
+    fn dev(vendor: &str, driver: &str, pci: &str) -> GpuDevice {
+        GpuDevice {
+            pci_id: pci.to_string(),
+            vendor_id: vendor.to_string(),
+            device_id: "0000".to_string(),
+            driver: driver.to_string(),
+            name: format!("GPU {vendor}:0"),
+            drm_card: "card0".to_string(),
+            hwmon_path: None,
+        }
+    }
+
+    /// Pure helper: sort key for the discover stable sort.
+    /// Returns `(is_amd, pci_id)` — sort AMD-first then by pci_id.
+    fn sort_key(d: &GpuDevice) -> (bool, String) {
+        let is_amd = d.vendor_id == "1002" || d.driver == "amdgpu";
+        (is_amd, d.pci_id.clone())
+    }
+
+    #[test]
+    fn amd_sorted_first() {
+        let mut devices = vec![
+            dev("10de", "nvidia", "0000:01:00.0"),
+            dev("1002", "amdgpu", "0000:04:00.0"),
+            dev("10de", "nvidia", "0000:02:00.0"),
+            dev("1002", "amdgpu", "0000:00:02.0"),
+        ];
+        // Same stable sort as discover(): AMD first, then pci_id
+        devices.sort_by(|a, b| {
+            let (a_amd, ref a_pci) = sort_key(a);
+            let (b_amd, ref b_pci) = sort_key(b);
+            b_amd.cmp(&a_amd).then_with(|| a_pci.cmp(b_pci))
+        });
+
+        // Assert AMD devices come first, in pci_id order
+        assert_eq!(devices[0].vendor_id, "1002");
+        assert_eq!(devices[0].pci_id, "0000:00:02.0");
+        assert_eq!(devices[1].vendor_id, "1002");
+        assert_eq!(devices[1].pci_id, "0000:04:00.0");
+        // Then NVIDIA, in pci_id order
+        assert_eq!(devices[2].vendor_id, "10de");
+        assert_eq!(devices[2].pci_id, "0000:01:00.0");
+        assert_eq!(devices[3].vendor_id, "10de");
+        assert_eq!(devices[3].pci_id, "0000:02:00.0");
+    }
 }

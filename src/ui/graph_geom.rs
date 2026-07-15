@@ -42,8 +42,12 @@ pub struct SeriesGeometry {
 // ---------------------------------------------------------------------------
 
 /// Map a boottime timestamp to pixel X using age-based position.
-/// Returns an X that may fall left of `plot_left` or right of `plot_right` —
-/// the canvas clip rect will cut off-screen portions.
+///
+/// Returns an X that may fall left of `plot_left` **or right of `plot_right`**.
+/// Samples newer than `window_end` (negative age) map past the right edge —
+/// required for delayed continuous windows where the next sample sits
+/// off-screen right and scrolls in with a real slope. The canvas clip cuts
+/// off-screen portions.
 fn age_to_x(
     t_boot_ns: u64,
     window_end_ns: u64,
@@ -51,12 +55,11 @@ fn age_to_x(
     plot_left: f32,
     plot_right: f32,
 ) -> f32 {
-    let age_ns = window_end_ns.saturating_sub(t_boot_ns);
+    // Signed age: t > window_end → negative → x > plot_right (do NOT clamp).
+    let age_ns = window_end_ns as i128 - t_boot_ns as i128;
     let plot_width = plot_right - plot_left;
-    let fraction = age_ns as f64 / window_ns.max(1) as f64;
-    let x = plot_right - fraction as f32 * plot_width;
-    // No clamping — clip rect handles off-screen x
-    x
+    let fraction = age_ns as f64 / (window_ns.max(1) as f64);
+    plot_right - fraction as f32 * plot_width
 }
 
 /// Map a value (0..max_value) to pixel Y (0 = bottom, max = top).
@@ -73,10 +76,12 @@ fn value_to_y(value: f32, max_value: f32, plot_top: f32, plot_bottom: f32) -> f3
 
 /// Cull points wholly outside the visible window, keeping:
 /// - The single off-left neighbor adjacent to the first in-window point (for
-///   incoming spline slope).
+///   incoming spline slope at the left clip).
 /// - All in-window points.
-/// - The newest point (always the last element; may be off-right after a
-///   clock jump but normally is in-window).
+/// - The single off-right neighbor after the last in-window point (for the
+///   real segment scrolling in from the right under a delayed window).
+/// - Trailing points beyond that one off-right neighbor are dropped to bound
+///   work (rings only hold ~1 future sample at Δ ≈ interval).
 ///
 /// This bounds tessellation work regardless of ring age (e.g. after a long
 /// suspend — critic finding 2).
@@ -93,19 +98,26 @@ fn cull_off_screen(
     let last_in = points.iter().rposition(|p| p.t_boot_ns <= window_end_ns);
 
     match (first_in, last_in) {
-        (Some(fi), Some(_)) => {
-            // Include off-left neighbor for entering slope
+        (Some(fi), Some(li)) => {
+            // Off-left neighbor for left clip slope; one past last_in for right.
             let start = fi.saturating_sub(1);
-            points[start..].to_vec()
+            let end = (li + 2).min(points.len()); // exclusive; includes li and li+1 if any
+            points[start..end].to_vec()
         }
         (None, Some(_)) => {
             // All points off-left (too old) — just keep the newest
             let last = points.len() - 1;
             vec![points[last]]
         }
-        (_, None) => {
-            // All points off-right (shouldn't happen) — keep the oldest
-            vec![points[0]]
+        (Some(fi), None) => {
+            // All remaining points are off-right (newer than window_end).
+            // Keep the first two from fi so a segment can enter as the window advances.
+            let end = (fi + 2).min(points.len());
+            points[fi..end].to_vec()
+        }
+        (None, None) => {
+            // Empty after filters — keep newest only
+            vec![points[points.len() - 1]]
         }
     }
 }
@@ -476,7 +488,8 @@ pub fn compute_series(
             }
         }
     }
-    // Final run
+    // Final run (no synthetic right-edge hold — delayed window + off-right
+    // samples provide real slope as segments scroll in from the right).
     if current_run.len() >= 2 {
         let cleaned = coalesce_degenerate_x(&current_run);
         let segs = smooth_run(&cleaned);
@@ -632,10 +645,18 @@ mod tests {
     }
 
     #[test]
-    fn age_to_x_future_clamped_to_right() {
+    fn age_to_x_future_maps_past_right() {
+        // Delayed window: samples newer than window_end sit off-screen right
+        // so they can scroll in with a real slope (not clamped to the edge).
         let x = age_to_x(110_000_000_000, 100_000_000_000, 60_000_000_000, 40.0, 496.0);
-        // t_boot > window_end → saturating_sub = 0 → age = 0 → right edge
-        assert!((x - 496.0).abs() < 0.5);
+        // 10s ahead of a 60s window → 1/6 of plot width past the right edge
+        let plot_width = 496.0 - 40.0;
+        let expected = 496.0 + (10.0 / 60.0) as f32 * plot_width;
+        assert!(
+            (x - expected).abs() < 1.0,
+            "future sample x={x} should be past plot_right (expected ~{expected})"
+        );
+        assert!(x > 496.0);
     }
 
     #[test]
@@ -1221,27 +1242,30 @@ mod tests {
         let window_secs = 60.0;
         let sample_v = |s: u64| 50.0 + 15.0 * (s as f32 * 0.2).sin(); // smooth
 
-        // Capacity 62 = 60s window + 2 edge-guard; prime with 80 samples.
-        let mut ring = Ring::new(62);
+        // Capacity 63 = 60s window + 3 edge-guard (left + delay + right).
+        use crate::model::history::EDGE_GUARD;
+        let mut ring = Ring::new(60 + EDGE_GUARD);
         for i in 0..80u64 {
             ring.push(SamplePoint::new(i * 1_000_000_000, sample_v(i)));
         }
 
-        // Sweep window_end 79.0s → 84.0s in 0.1s steps; push real samples as the
-        // clock crosses each integer second so eviction is genuinely exercised.
+        // Delayed continuous: window_end lags newest sample by 1s. Sweep wall
+        // clock so newest goes 80→85 while display_end = newest − 1s.
+        // Assert geometry spans BOTH clip edges (off-left + off-right anchors).
         let mut next_push_s = 80u64;
-        let mut prev: Option<f32> = None;
+        let mut prev_left: Option<f32> = None;
         let mut observed = 0;
         for step in 0..=50u64 {
-            let end_ns = 79_000_000_000 + step * 100_000_000;
-            let end_s = end_ns / 1_000_000_000;
-            while next_push_s <= end_s {
+            let newest_ns = 80_000_000_000 + step * 100_000_000;
+            let newest_s = newest_ns / 1_000_000_000;
+            while next_push_s <= newest_s {
                 ring.push(SamplePoint::new(
                     next_push_s * 1_000_000_000,
                     sample_v(next_push_s),
                 ));
                 next_push_s += 1;
             }
+            let end_ns = newest_ns.saturating_sub(1_000_000_000); // delay = 1s
 
             let window = DrawWindow {
                 window_secs,
@@ -1250,24 +1274,137 @@ mod tests {
             let pts = ring.points();
             let geom = compute_series(&pts, 100.0, &window, &bounds, false);
 
-            // The curve MUST cross the left clip edge on EVERY frame — a frame
-            // with no crossing is exactly the disappearance (pop) this test
-            // exists to catch (finding 3). So require it, don't skip.
-            let y = curve_y_at_x(&geom, bounds.left)
-                .unwrap_or_else(|| panic!("no curve at left clip edge on frame {step} (segment disappeared)"));
-            if let Some(py) = prev {
-                // One 0.1s step is ~1/10 of a sample; the left-edge y must move
-                // far less than a full sample's worth (max ~3.0), including
-                // across the push/evict events. Threshold < 1 sample.
-                let dy = (y - py).abs();
+            let y_left = curve_y_at_x(&geom, bounds.left).unwrap_or_else(|| {
+                panic!("no curve at left clip on frame {step} (off-left anchor lost)")
+            });
+            // Right edge: delayed window always has a real segment crossing or
+            // ending at/near plot_right (off-right neighbor past the frame).
+            let y_right = curve_y_at_x(&geom, bounds.right).unwrap_or_else(|| {
+                panic!("no curve at right clip on frame {step} (off-right anchor lost)")
+            });
+            let _ = y_right;
+
+            if let Some(py) = prev_left {
+                let dy = (y_left - py).abs();
                 assert!(
                     dy < 1.5,
-                    "left-edge y discontinuity at step {step}: prev={py} y={y} dy={dy}"
+                    "left-edge y discontinuity at step {step}: prev={py} y={y_left} dy={dy}"
                 );
             }
-            prev = Some(y);
+            prev_left = Some(y_left);
             observed += 1;
         }
-        assert_eq!(observed, 51, "expected a left-edge crossing on every frame");
+        assert_eq!(observed, 51, "expected left+right clip crossings on every frame");
+    }
+
+    // ----- delayed continuous window (off-right real samples) -----
+
+    fn last_bezier_endpoint(geom: &SeriesGeometry) -> Option<(f32, f32)> {
+        geom.bezier_runs.last()?.last().map(|seg| seg.end)
+    }
+
+    #[test]
+    fn delayed_window_future_sample_maps_past_right() {
+        let window_end = 100_000_000_000u64;
+        let window = DrawWindow {
+            window_secs: 60.0,
+            window_end_ns: window_end,
+        };
+        let bounds = make_bounds();
+        // In-window + one sample 1s in the future (off-right)
+        let pts = vec![
+            pt(20.0, 90_000_000_000),
+            pt(40.0, 99_000_000_000),
+            pt(80.0, 101_000_000_000), // future
+        ];
+        let geom = compute_series(&pts, 100.0, &window, &bounds, false);
+        let end = last_bezier_endpoint(&geom).expect("should produce a run");
+        assert!(
+            end.0 > bounds.right,
+            "future sample endpoint should be past plot_right, got {}",
+            end.0
+        );
+    }
+
+    #[test]
+    fn delayed_window_segment_shape_stable_as_window_advances() {
+        // Non-collinear triple so monotone-cubic (not the 2-point secant case)
+        // is exercised. Advancing window_end must only translate X uniformly;
+        // control-point Y geometry of the interior segment stays put.
+        let bounds = make_bounds();
+        let s = 1_000_000_000u64;
+        // Values 20 → 80 → 40 so interior tangents are nontrivial.
+        let pts = vec![pt(20.0, 50 * s), pt(80.0, 51 * s), pt(40.0, 52 * s)];
+        let window_ns = 60 * s;
+
+        let segs_at = |window_end: u64| {
+            let window = DrawWindow {
+                window_secs: 60.0,
+                window_end_ns: window_end,
+            };
+            compute_series(&pts, 100.0, &window, &bounds, false)
+        };
+
+        // Both ends keep all three points: at 51.2s → {50,51} in + 52 off-right;
+        // at 51.8s → same membership, scrolled 0.6s. Membership constant so the
+        // cubic is the same shape translated in X.
+        let end0 = 51 * s + 200_000_000;
+        let end1 = 51 * s + 800_000_000;
+        let g0 = segs_at(end0);
+        let g1 = segs_at(end1);
+        assert_eq!(g0.bezier_runs.len(), 1);
+        assert_eq!(g1.bezier_runs.len(), 1);
+        assert_eq!(g0.bezier_runs[0].len(), 2, "need 3 points → 2 cubic segments");
+        assert_eq!(g1.bezier_runs[0].len(), 2);
+
+        let dx_expected = age_to_x(50 * s, end1, window_ns, bounds.left, bounds.right)
+            - age_to_x(50 * s, end0, window_ns, bounds.left, bounds.right);
+
+        for (a, b) in g0.bezier_runs[0].iter().zip(g1.bezier_runs[0].iter()) {
+            // Y geometry (values) unchanged
+            assert!((a.start.1 - b.start.1).abs() < 1e-3, "start y rewrote");
+            assert!((a.c1.1 - b.c1.1).abs() < 1e-3, "c1 y rewrote");
+            assert!((a.c2.1 - b.c2.1).abs() < 1e-3, "c2 y rewrote");
+            assert!((a.end.1 - b.end.1).abs() < 1e-3, "end y rewrote");
+            // X translates uniformly by the window scroll (endpoints + controls)
+            assert!((b.start.0 - a.start.0 - dx_expected).abs() < 0.5, "start x not pure translate");
+            assert!((b.c1.0 - a.c1.0 - dx_expected).abs() < 0.5, "c1 x not pure translate");
+            assert!((b.c2.0 - a.c2.0 - dx_expected).abs() < 0.5, "c2 x not pure translate");
+            assert!((b.end.0 - a.end.0 - dx_expected).abs() < 0.5, "end x not pure translate");
+        }
+    }
+
+    #[test]
+    fn delayed_window_no_synthetic_hold_segment() {
+        // A single in-window sample with no off-right neighbor produces no
+        // geometry (need 2 points) — we never invent a flat to the edge.
+        let window = DrawWindow {
+            window_secs: 60.0,
+            window_end_ns: 70_000_000_000,
+        };
+        let bounds = make_bounds();
+        let pts = vec![pt(50.0, 65_000_000_000)];
+        let geom = compute_series(&pts, 100.0, &window, &bounds, false);
+        assert!(
+            geom.bezier_runs.is_empty(),
+            "no synthetic hold: single sample must not invent a segment"
+        );
+    }
+
+    #[test]
+    fn cull_keeps_one_off_right_neighbor() {
+        let window_start = 40_000_000_000u64;
+        let window_end = 100_000_000_000u64;
+        let pts = vec![
+            pt(1.0, 30_000_000_000),  // off-left
+            pt(2.0, 50_000_000_000),  // in
+            pt(3.0, 90_000_000_000),  // in
+            pt(4.0, 101_000_000_000), // off-right neighbor
+            pt(5.0, 102_000_000_000), // farther future — drop
+        ];
+        let culled = cull_off_screen(&pts, window_start, window_end);
+        assert_eq!(culled.len(), 4, "off-left + 2 in + 1 off-right");
+        assert_eq!(culled[0].t_boot_ns, 30_000_000_000);
+        assert_eq!(culled[3].t_boot_ns, 101_000_000_000);
     }
 }

@@ -101,9 +101,12 @@ pub const MIN_INTERVAL_MS: u64 = 100;
 pub const MAX_INTERVAL_MS: u64 = 60_000;
 pub const MAX_WINDOW_SECS: u64 = 7200; // 2 hours
 pub const MAX_POINTS_PER_SERIES: usize = 7200;
-/// Keep 2 extra samples beyond the visible window so the left edge can slide
-/// smoothly under the clip rect (anchor for monotone-cubic incoming slope).
-pub const EDGE_GUARD: usize = 2;
+/// Extra samples beyond `floor(window/interval)` for edge geometry:
+/// - 1 off-left neighbor (monotone-cubic slope into the left clip)
+/// - 1 delay sample (chart `window_end` lags wall clock by one interval)
+/// - 1 off-right neighbor (real segment scrolling in from the right)
+/// Total +3 so delayed continuous windows still have both edge anchors.
+pub const EDGE_GUARD: usize = 3;
 
 /// Validated history configuration. Can only be constructed via `validate()`.
 #[derive(Clone, Debug, PartialEq)]
@@ -114,7 +117,7 @@ pub struct HistoryConfig {
 }
 
 impl HistoryConfig {
-    /// Default: 1 s interval, 60 s window → 60 base + 2 edge-guard = 62 capacity.
+    /// Default: 1 s interval, 60 s window → 60 base + 3 edge-guard = 63 capacity.
     pub fn default_config() -> Self {
         let base = DEFAULT_HISTORY_SECS as usize;
         Self {
@@ -169,7 +172,7 @@ impl HistoryConfig {
                 "capacity {base_capacity} exceeds maximum {MAX_POINTS_PER_SERIES}"
             ));
         }
-        // Add edge-guard samples for smooth left-edge animation under clip.
+        // Edge-guard: left neighbor + delay lag + right neighbor (see EDGE_GUARD).
         // Guard storage is allowed to exceed the ceiling — see EDGE_GUARD docs.
         let capacity = base_capacity + EDGE_GUARD;
 
@@ -576,7 +579,7 @@ mod tests {
     #[test]
     fn history_config_default() {
         let c = HistoryConfig::default_config();
-        assert_eq!(c.capacity, 62);
+        assert_eq!(c.capacity, 63);
         assert_eq!(c.interval, Duration::from_secs(1));
         assert_eq!(c.window, Duration::from_secs(60));
     }
@@ -622,16 +625,16 @@ mod tests {
     #[test]
     fn history_config_accept_valid() {
         let c = HistoryConfig::validate(1000, 60).unwrap();
-        assert_eq!(c.capacity, 62);
+        assert_eq!(c.capacity, 63);
         assert_eq!(c.interval, Duration::from_millis(1000));
         assert_eq!(c.window, Duration::from_secs(60));
     }
 
     #[test]
     fn history_config_7200_boundary_with_guard() {
-        // 1s interval, 7200s window → base = 7200 (at ceiling), capacity = 7202.
+        // 1s interval, 7200s window → base = 7200 (at ceiling), capacity = 7203.
         let c = HistoryConfig::validate(1000, 7200).unwrap();
-        assert_eq!(c.capacity, 7202);
+        assert_eq!(c.capacity, 7203);
         assert_eq!(c.interval, Duration::from_millis(1000));
         assert_eq!(c.window, Duration::from_secs(7200));
     }

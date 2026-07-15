@@ -146,8 +146,11 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
     let snap = &published.snapshot;
     let hist = &published.history;
     let window_secs = app.config.window.as_secs_f64();
-    // Smooth clock: window_end is boottime "now" on each display tick.
-    let window_end_ns = crate::clock_boottime_ns();
+    // Delayed continuous window: chart "now" lags wall clock by one sample
+    // interval so the next real sample sits off-screen right and scrolls in
+    // with a true slope (no flat-hold / provisional history).
+    let delay_ns = app.config.interval.as_nanos() as u64;
+    let window_end_ns = crate::clock_boottime_ns().saturating_sub(delay_ns);
 
     let presets = {
         let buttons: Vec<Element<Message>> = app
@@ -309,7 +312,8 @@ fn cpu_section(
         .width(Length::Fill)
         .height(Length::Fixed(180.0));
 
-    // Legend: 4 columns below the chart (GSM-style)
+    // Legend: 4 equal-width columns spanning the panel (GSM-style).
+    // Fixed-width chips + padded % so "  1%" → "100%" never reflows neighbors.
     let cores = &hist.cpu_per_core;
     let n = cores.len();
     let per_col = n.div_ceil(4).max(1);
@@ -319,7 +323,13 @@ fn cpu_section(
         let start = col_idx * per_col;
         let end = ((col_idx + 1) * per_col).min(n);
         if start >= n {
-            break;
+            // Keep empty columns so the row still distributes full width.
+            legend_cols.push(
+                column![Space::new().height(1)]
+                    .width(Length::Fill)
+                    .into(),
+            );
+            continue;
         }
         let items: Vec<Element<Message>> = cores[start..end]
             .iter()
@@ -330,19 +340,25 @@ fn cpu_section(
                     .iter()
                     .find(|cr| cr.id == *core_id)
                     .and_then(|cr| match &cr.value {
-                        Reading::Value(v) => Some(format!("{:3.0}%", v)),
+                        // Width 4 for "  0%" … "100%" — fixed digit field.
+                        Reading::Value(v) => Some(format!("{v:3.0}%")),
                         _ => None,
                     })
                     .unwrap_or_else(|| "  —".to_string());
                 let color = theme::core_color(core_id.0);
                 let label = format!("{} {}", core_id.label(), pct_str);
-                legend_chip(&label, color)
+                legend_chip_fixed(&label, color)
             })
             .collect();
-        legend_cols.push(column(items).spacing(1).into());
+        legend_cols.push(
+            column(items)
+                .spacing(2)
+                .width(Length::Fill)
+                .into(),
+        );
     }
 
-    let legend = row(legend_cols).spacing(16);
+    let legend = row(legend_cols).spacing(8).width(Length::Fill);
 
     // Wrap in a panel card
     panel(header.into(), column![canvas, legend].spacing(4).into())
@@ -431,7 +447,8 @@ fn gpu_section(
     window_secs: f64,
     window_end_ns: u64,
 ) -> Element<'static, Message> {
-    let util = rfmt(&gpu.util_percent, |v| format!("{v:.1}%"));
+    // Fixed-width value strings so "0.0%" → "100.0%" does not reflow the row.
+    let util = rfmt(&gpu.util_percent, |v| format!("{v:5.1}%"));
     let vram = match (&gpu.vram_used_kb, &gpu.vram_total_kb) {
         (Reading::Value(u), Reading::Value(t)) => {
             let pct = if *t > 0 {
@@ -439,23 +456,24 @@ fn gpu_section(
             } else {
                 0.0
             };
-            format!("{:.0}% ({:.0} MiB)", pct, *u as f64 / 1024.0)
+            format!("{pct:3.0}% ({:4.0} MiB)", *u as f64 / 1024.0)
         }
         _ => "--".into(),
     };
-    let temp = rfmt_opt(&gpu.temp_celsius, |v| format!("{v:.1}°C"));
-    let power = rfmt_opt(&gpu.power_watts, |v| format!("{v:.1} W"));
+    let temp = rfmt_opt(&gpu.temp_celsius, |v| format!("{v:5.1}°C"));
+    let power = rfmt_opt(&gpu.power_watts, |v| format!("{v:5.1} W"));
 
     let title = format!("{} -- {}", gpu.name, gpu.pci_id);
 
+    // Fixed-width stat chips — Util was the worst offender (0.0% vs 60.0%).
     let stats = row![
-        stat_box("Util", util, theme::ACCENT_GPU),
+        stat_box_fixed("Util", util, theme::ACCENT_GPU, 64.0),
         Space::new().width(6),
-        stat_box("VRAM", vram, theme::ACCENT_GPU),
+        stat_box_fixed("VRAM", vram, theme::ACCENT_GPU, 110.0),
         Space::new().width(6),
-        stat_box("Temp", temp, theme::ACCENT_TEMP),
+        stat_box_fixed("Temp", temp, theme::ACCENT_TEMP, 64.0),
         Space::new().width(6),
-        stat_box("Power", power, theme::ACCENT_WARN),
+        stat_box_fixed("Power", power, theme::ACCENT_WARN, 64.0),
     ]
     .spacing(0);
 
@@ -534,6 +552,30 @@ fn stat_box(label: &str, value: String, color: Color) -> Element<'static, Messag
     .into()
 }
 
+/// Like [`stat_box`] but with a fixed outer width so digit-width changes
+/// (e.g. GPU Util `0.0%` → `60.0%`) do not shift neighboring chips.
+fn stat_box_fixed(
+    label: &str,
+    value: String,
+    color: Color,
+    width: f32,
+) -> Element<'static, Message> {
+    container(
+        column![
+            text(label.to_owned()).size(10).color(theme::TEXT_DIM),
+            text(value).size(13).color(color),
+        ]
+        .spacing(1),
+    )
+    .padding(4)
+    .width(Length::Fixed(width))
+    .style(move |_theme| container::Style {
+        background: Some(iced::Background::Color(theme::SURFACE)),
+        ..Default::default()
+    })
+    .into()
+}
+
 /// A small colored legend chip: a color square + label.
 fn legend_chip(label: &str, color: Color) -> Element<'static, Message> {
     let label_owned = label.to_owned();
@@ -548,5 +590,24 @@ fn legend_chip(label: &str, color: Color) -> Element<'static, Message> {
         text(label_owned).size(10).color(theme::TEXT_DIM),
     ]
     .align_y(Alignment::Center)
+    .into()
+}
+
+/// Full-width legend chip for the 4-column CPU legend — fills its column so
+/// digit-width changes in the percentage do not shove neighboring chips.
+fn legend_chip_fixed(label: &str, color: Color) -> Element<'static, Message> {
+    let label_owned = label.to_owned();
+    let swatch = container(Space::new().width(8).height(8))
+        .style(move |_theme| container::Style {
+            background: Some(iced::Background::Color(color)),
+            ..Default::default()
+        });
+    row![
+        swatch,
+        Space::new().width(6),
+        text(label_owned).size(11).color(theme::TEXT_DIM),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
     .into()
 }

@@ -20,7 +20,11 @@ pub const ACCENT_WARN: Color = Color::from_rgb(0.95, 0.65, 0.15);
 // Plot frame and axis colors (panel-chart-redesign).
 pub const BORDER: Color = Color::from_rgb(0.20, 0.20, 0.25);
 pub const PLOT_FRAME: Color = Color::from_rgb(0.30, 0.30, 0.36);
-pub const GRID: Color = Color::from_rgb(0.18, 0.18, 0.22);
+/// Interior of the plot frame (behind series + grid). Pure black so the
+/// panel SURFACE grey does not show through the chart.
+pub const PLOT_BG: Color = Color::from_rgb(0.0, 0.0, 0.0);
+/// Grid lines on PLOT_BG — mid grey, clearly above black and below the frame.
+pub const GRID: Color = Color::from_rgb(0.22, 0.22, 0.26);
 pub const AXIS_LABEL: Color = Color::from_rgb(0.42, 0.42, 0.48);
 
 /// Return a copy of `color` with the alpha channel set to `a`.
