@@ -45,6 +45,7 @@ impl MultiChart {
         Self {
             series: Vec::new(),
             window: DrawWindow {
+                sample_interval_ns: 1_000_000_000,
                 window_secs: 60.0,
                 window_end_ns: 0,
             },
@@ -183,9 +184,7 @@ fn draw_multi_chart(frame: &mut Frame, chart: &MultiChart, size: Size) {
 
         // Grid (horizontal at 25/50/75%, vertical at interior time ticks)
         let grid_ys = graph_geom::compute_grid_y(&bounds);
-        let grid_stroke = Stroke::default()
-            .with_color(theme::GRID)
-            .with_width(0.5);
+        let grid_stroke = Stroke::default().with_color(theme::GRID).with_width(0.5);
         for y in grid_ys {
             let path = Path::line(pt(bounds.left, y), pt(bounds.right, y));
             clipped.stroke(&path, grid_stroke);

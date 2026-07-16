@@ -72,11 +72,15 @@ fn apply_gpu_env() {
     );
     if let Some(v) = bundle.power_pref {
         // SAFETY: single-threaded startup — see fn doc.
-        unsafe { std::env::set_var("WGPU_POWER_PREF", v); }
+        unsafe {
+            std::env::set_var("WGPU_POWER_PREF", v);
+        }
     }
     if let Some(v) = bundle.vk_icd_filenames {
         // SAFETY: single-threaded startup — see fn doc.
-        unsafe { std::env::set_var("VK_ICD_FILENAMES", v); }
+        unsafe {
+            std::env::set_var("VK_ICD_FILENAMES", v);
+        }
     }
 }
 

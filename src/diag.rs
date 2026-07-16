@@ -90,7 +90,11 @@ fn print_snapshot(snap: &Snapshot) {
 
     // Self
     println!("Self:");
-    print!("  RSS:      ");
+    print!("  RSS Anon: ");
+    println_reading(&snap.self_metrics.rss_anon_kb, |v| {
+        format!("{} kB ({:.1} MiB)", v, *v as f64 / 1024.0)
+    });
+    print!("  RSS (Vm): ");
     println_reading(&snap.self_metrics.rss_kb, |v| {
         format!("{} kB ({:.1} MiB)", v, *v as f64 / 1024.0)
     });

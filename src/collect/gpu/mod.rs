@@ -92,9 +92,7 @@ pub fn discover(sys_root: &str) -> Vec<GpuDevice> {
     devices.sort_by(|a, b| {
         let a_amd = a.vendor_id == "1002" || a.driver == "amdgpu";
         let b_amd = b.vendor_id == "1002" || b.driver == "amdgpu";
-        b_amd
-            .cmp(&a_amd)
-            .then_with(|| a.pci_id.cmp(&b.pci_id))
+        b_amd.cmp(&a_amd).then_with(|| a.pci_id.cmp(&b.pci_id))
     });
 
     devices
@@ -161,7 +159,7 @@ mod tests {
 
     #[test]
     fn amd_sorted_first() {
-        let mut devices = vec![
+        let mut devices = [
             dev("10de", "nvidia", "0000:01:00.0"),
             dev("1002", "amdgpu", "0000:04:00.0"),
             dev("10de", "nvidia", "0000:02:00.0"),

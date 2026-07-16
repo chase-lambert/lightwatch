@@ -95,6 +95,7 @@ mod tests {
                 gpus: vec![],
                 self_metrics: SelfSnapshot {
                     rss_kb: crate::model::Reading::Unavailable { reason: "test" },
+                    rss_anon_kb: crate::model::Reading::Unavailable { reason: "test" },
                     cpu_percent: crate::model::Reading::Unavailable { reason: "test" },
                     uptime_secs: 0,
                     sample_duration_us: 0,

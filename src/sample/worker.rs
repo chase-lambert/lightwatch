@@ -241,8 +241,7 @@ impl Sampler {
             // authoritative snapshot of the full live topology.
             // Empty samples never permit removal.
             let online = online_core_ids_normalized();
-            let snap_ids: Vec<CoreId> =
-                normalized_cores.iter().map(|c| c.id).collect();
+            let snap_ids: Vec<CoreId> = normalized_cores.iter().map(|c| c.id).collect();
             let permit_removal = is_complete_sample(&snap_ids, &online);
             self.history
                 .reconcile_cores(&self.config, &normalized_cores, permit_removal);
@@ -452,9 +451,7 @@ fn parse_cpu_online_ranges(ranges: &str) -> Result<Vec<CoreId>, String> {
     for part in input.split(',') {
         let part = part.trim();
         if part.is_empty() {
-            return Err(format!(
-                "empty segment in cpu online range: {ranges:?}"
-            ));
+            return Err(format!("empty segment in cpu online range: {ranges:?}"));
         }
         if let Some(pos) = part.find('-') {
             let start_str = part[..pos].trim();
@@ -465,14 +462,10 @@ fn parse_cpu_online_ranges(ranges: &str) -> Result<Vec<CoreId>, String> {
                 ));
             }
             let start = start_str.parse::<u32>().map_err(|_| {
-                format!(
-                    "non-numeric range start {start_str:?} in cpu online range: {ranges:?}"
-                )
+                format!("non-numeric range start {start_str:?} in cpu online range: {ranges:?}")
             })?;
             let end = end_str.parse::<u32>().map_err(|_| {
-                format!(
-                    "non-numeric range end {end_str:?} in cpu online range: {ranges:?}"
-                )
+                format!("non-numeric range end {end_str:?} in cpu online range: {ranges:?}")
             })?;
             if start > end {
                 return Err(format!(
@@ -484,9 +477,7 @@ fn parse_cpu_online_ranges(ranges: &str) -> Result<Vec<CoreId>, String> {
             }
         } else {
             let n = part.parse::<u32>().map_err(|_| {
-                format!(
-                    "non-numeric segment {part:?} in cpu online range: {ranges:?}"
-                )
+                format!("non-numeric segment {part:?} in cpu online range: {ranges:?}")
             })?;
             ids.push(CoreId(n));
         }
@@ -502,8 +493,7 @@ fn parse_cpu_online_ranges(ranges: &str) -> Result<Vec<CoreId>, String> {
 /// - File nonempty but unparseable → return empty (treat topology as unknown);
 ///   this ensures `is_complete_sample` cannot authorize history-ring removal.
 fn online_core_ids() -> Vec<CoreId> {
-    let content =
-        std::fs::read_to_string("/sys/devices/system/cpu/online").unwrap_or_default();
+    let content = std::fs::read_to_string("/sys/devices/system/cpu/online").unwrap_or_default();
     let content = content.trim();
     if content.is_empty() {
         return detect_core_ids();
@@ -631,9 +621,11 @@ pub fn run_soak(config: &HistoryConfig, total_seconds: u64) {
 
     let mut sample_count: u64 = 0;
     let mut sum_rss: u64 = 0;
+    let mut sum_anon: u64 = 0;
     let mut sum_self_cpu: f32 = 0.0;
     let mut sum_cpu: f32 = 0.0;
     let mut max_rss: u64 = 0;
+    let mut max_anon: u64 = 0;
 
     println!(
         "soak: sampling every {:?} for {}s ...",
@@ -651,6 +643,11 @@ pub fn run_soak(config: &HistoryConfig, total_seconds: u64) {
             sum_rss += rss;
             max_rss = max_rss.max(rss);
             print!("  [{:>3}] rss={:>8} kB", sample_count, rss);
+        }
+        if let Reading::Value(anon) = self_snap.rss_anon_kb {
+            sum_anon += anon;
+            max_anon = max_anon.max(anon);
+            print!("  anon={:>8} kB", anon);
         }
         if let Reading::Value(sc) = self_snap.cpu_percent {
             sum_self_cpu += sc;
@@ -673,7 +670,12 @@ pub fn run_soak(config: &HistoryConfig, total_seconds: u64) {
     }
 
     let avg_rss = if sample_count > 0 {
-        sum_rss / sample_count
+        sum_rss.checked_div(sample_count).unwrap_or(0)
+    } else {
+        0
+    };
+    let avg_anon = if sample_count > 0 {
+        sum_anon.checked_div(sample_count).unwrap_or(0)
     } else {
         0
     };
@@ -690,6 +692,14 @@ pub fn run_soak(config: &HistoryConfig, total_seconds: u64) {
 
     println!("--- soak summary ---");
     println!("  samples:     {sample_count}");
+    println!(
+        "  avg_anon:    {avg_anon} kB  ({:.1} MiB)",
+        avg_anon as f64 / 1024.0
+    );
+    println!(
+        "  max_anon:    {max_anon} kB  ({:.1} MiB)",
+        max_anon as f64 / 1024.0
+    );
     println!(
         "  avg_rss:     {avg_rss} kB  ({:.1} MiB)",
         avg_rss as f64 / 1024.0
@@ -777,19 +787,13 @@ mod tests {
     #[test]
     fn parse_range_multi_ranges() {
         let ids = parse_cpu_online_ranges("0-1,4-5").unwrap();
-        assert_eq!(
-            ids,
-            vec![CoreId(0), CoreId(1), CoreId(4), CoreId(5)]
-        );
+        assert_eq!(ids, vec![CoreId(0), CoreId(1), CoreId(4), CoreId(5)]);
     }
 
     #[test]
     fn parse_range_single_and_range() {
         let ids = parse_cpu_online_ranges("0,2-3").unwrap();
-        assert_eq!(
-            ids,
-            vec![CoreId(0), CoreId(2), CoreId(3)]
-        );
+        assert_eq!(ids, vec![CoreId(0), CoreId(2), CoreId(3)]);
     }
 
     #[test]
@@ -868,8 +872,16 @@ mod tests {
     #[test]
     fn ghost_cores_in_sample_but_all_online_present() {
         // Sample still has ghost cores from old topology, but all online present
-        let snap = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3),
-                        CoreId(4), CoreId(5), CoreId(6), CoreId(7)];
+        let snap = vec![
+            CoreId(0),
+            CoreId(1),
+            CoreId(2),
+            CoreId(3),
+            CoreId(4),
+            CoreId(5),
+            CoreId(6),
+            CoreId(7),
+        ];
         let online = vec![CoreId(0), CoreId(1), CoreId(2), CoreId(3)];
         assert!(is_complete_sample(&snap, &online));
     }

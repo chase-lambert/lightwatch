@@ -102,11 +102,15 @@ pub const MAX_INTERVAL_MS: u64 = 60_000;
 pub const MAX_WINDOW_SECS: u64 = 7200; // 2 hours
 pub const MAX_POINTS_PER_SERIES: usize = 7200;
 /// Extra samples beyond `floor(window/interval)` for edge geometry:
-/// - 1 off-left neighbor (monotone-cubic slope into the left clip)
-/// - 1 delay sample (chart `window_end` lags wall clock by one interval)
-/// - 1 off-right neighbor (real segment scrolling in from the right)
-/// Total +3 so delayed continuous windows still have both edge anchors.
-pub const EDGE_GUARD: usize = 3;
+/// - 3 off-left neighbors (stable monotone-cubic tangents at left clip;
+///   the third prevents the leftmost culled point from becoming the spline
+///   endpoint during sub-interval window scroll).
+/// - 2 off-right neighbors (final-shape segments scrolling in from the right).
+/// - The two-interval diagnostic delay requires two future samples beyond the
+///   visible right edge, which are covered by the off-right neighbors.
+///
+/// Total +6 so every chart enters and leaves with immutable spline geometry.
+pub const EDGE_GUARD: usize = 6;
 
 /// Validated history configuration. Can only be constructed via `validate()`.
 #[derive(Clone, Debug, PartialEq)]
@@ -117,7 +121,7 @@ pub struct HistoryConfig {
 }
 
 impl HistoryConfig {
-    /// Default: 1 s interval, 60 s window → 60 base + 3 edge-guard = 63 capacity.
+    /// Default: 1 s interval, 60 s window → 60 base + 6 edge-guard = 66 capacity.
     pub fn default_config() -> Self {
         let base = DEFAULT_HISTORY_SECS as usize;
         Self {
@@ -172,8 +176,9 @@ impl HistoryConfig {
                 "capacity {base_capacity} exceeds maximum {MAX_POINTS_PER_SERIES}"
             ));
         }
-        // Edge-guard: left neighbor + delay lag + right neighbor (see EDGE_GUARD).
-        // Guard storage is allowed to exceed the ceiling — see EDGE_GUARD docs.
+        // Edge-guard: three off-left + two off-right neighbors plus inclusive
+        // boundary accounting for the final-shape stencil. Guard storage may exceed
+        // the base ceiling — it is a constant per-series cost.
         let capacity = base_capacity + EDGE_GUARD;
 
         Ok(Self {
@@ -319,10 +324,8 @@ impl History {
     /// rings are created for each.
     pub fn new(config: &HistoryConfig, core_ids: &[CoreId], gpu_ids: &[String]) -> Self {
         let cap = config.capacity;
-        let cpu_per_core: Vec<(CoreId, Ring)> = core_ids
-            .iter()
-            .map(|&id| (id, Ring::new(cap)))
-            .collect();
+        let cpu_per_core: Vec<(CoreId, Ring)> =
+            core_ids.iter().map(|&id| (id, Ring::new(cap))).collect();
         let gpu_series: Vec<GpuHistory> = gpu_ids
             .iter()
             .map(|id| GpuHistory {
@@ -400,8 +403,7 @@ impl History {
             // Authoritative topology: removal first (makes room), then adds.
             let snap_ids: std::collections::HashSet<CoreId> =
                 snapshot_cores.iter().map(|c| c.id).collect();
-            self.cpu_per_core
-                .retain(|(id, _)| snap_ids.contains(id));
+            self.cpu_per_core.retain(|(id, _)| snap_ids.contains(id));
             for core in snapshot_cores {
                 if !self.cpu_per_core.iter().any(|(id, _)| *id == core.id) {
                     let ring = Ring::new(cap);
@@ -488,6 +490,9 @@ pub struct GpuSnapshot {
 #[derive(Clone, Debug)]
 pub struct SelfSnapshot {
     pub rss_kb: Reading<u64>,
+    /// Anonymous resident memory — lightwatch's private footprint
+    /// (excludes GPU/file mappings that inflate total RSS).
+    pub rss_anon_kb: Reading<u64>,
     pub cpu_percent: Reading<f32>,
     pub uptime_secs: u64,
     pub sample_duration_us: u64,
@@ -579,7 +584,7 @@ mod tests {
     #[test]
     fn history_config_default() {
         let c = HistoryConfig::default_config();
-        assert_eq!(c.capacity, 63);
+        assert_eq!(c.capacity, 66);
         assert_eq!(c.interval, Duration::from_secs(1));
         assert_eq!(c.window, Duration::from_secs(60));
     }
@@ -625,16 +630,16 @@ mod tests {
     #[test]
     fn history_config_accept_valid() {
         let c = HistoryConfig::validate(1000, 60).unwrap();
-        assert_eq!(c.capacity, 63);
+        assert_eq!(c.capacity, 66);
         assert_eq!(c.interval, Duration::from_millis(1000));
         assert_eq!(c.window, Duration::from_secs(60));
     }
 
     #[test]
     fn history_config_7200_boundary_with_guard() {
-        // 1s interval, 7200s window → base = 7200 (at ceiling), capacity = 7203.
+        // 1s interval, 7200s window → base = 7200 (at ceiling), capacity = 7206.
         let c = HistoryConfig::validate(1000, 7200).unwrap();
-        assert_eq!(c.capacity, 7203);
+        assert_eq!(c.capacity, 7206);
         assert_eq!(c.interval, Duration::from_millis(1000));
         assert_eq!(c.window, Duration::from_secs(7200));
     }
@@ -951,11 +956,7 @@ mod tests {
         hist.reconcile_cores(&config, &snap, true);
         assert_eq!(hist.cpu_per_core.len(), 8);
         // Old cores 0-3 should have been removed, 8-11 added
-        let ids: Vec<CoreId> = hist
-            .cpu_per_core
-            .iter()
-            .map(|(id, _)| *id)
-            .collect();
+        let ids: Vec<CoreId> = hist.cpu_per_core.iter().map(|(id, _)| *id).collect();
         assert!(!ids.contains(&CoreId(0)));
         assert!(!ids.contains(&CoreId(3)));
         assert!(ids.contains(&CoreId(10)));

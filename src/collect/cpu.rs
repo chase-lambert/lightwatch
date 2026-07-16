@@ -140,7 +140,7 @@ fn read_cpu_freq(sys_root: &str) -> Reading<f32> {
 
     if count > 0 {
         // freq is in kHz, convert to MHz
-        Reading::Value((total_freq / count) as f32 / 1000.0)
+        Reading::Value(total_freq.checked_div(count).unwrap_or(0) as f32 / 1000.0)
     } else {
         Reading::Unavailable {
             reason: "no cpu freq",

@@ -116,13 +116,10 @@ pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
             // Validate BEFORE mutating selected_preset.
             let interval_ms = app.config.interval.as_millis() as u64;
             let window_secs = preset.window_secs();
-            match HistoryConfig::validate(interval_ms, window_secs) {
-                Ok(new_config) => {
-                    app.selected_preset = preset;
-                    *app.pending_config.lock().unwrap() = Some(new_config.clone());
-                    app.config = new_config;
-                }
-                Err(_) => {}
+            if let Ok(new_config) = HistoryConfig::validate(interval_ms, window_secs) {
+                app.selected_preset = preset;
+                *app.pending_config.lock().unwrap() = Some(new_config.clone());
+                app.config = new_config;
             }
             iced::Task::none()
         }
@@ -146,10 +143,11 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
     let snap = &published.snapshot;
     let hist = &published.history;
     let window_secs = app.config.window.as_secs_f64();
-    // Delayed continuous window: chart "now" lags wall clock by one sample
-    // interval so the next real sample sits off-screen right and scrolls in
-    // with a true slope (no flat-hold / provisional history).
-    let delay_ns = app.config.interval.as_nanos() as u64;
+    // Two-interval diagnostic look-ahead: chart "now" lags wall clock by two
+    // sample intervals so the next two real samples sit off-screen right and
+    // scroll in with immutable spline geometry (no re-fitting at reveal).
+    let interval_ns = app.config.interval.as_nanos() as u64;
+    let delay_ns = interval_ns.saturating_mul(2);
     let window_end_ns = crate::clock_boottime_ns().saturating_sub(delay_ns);
 
     let presets = {
@@ -179,15 +177,33 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
     content = content.push(presets);
 
     // CPU section (chart-dominant)
-    content = content.push(cpu_section(snap, hist, window_secs, window_end_ns));
+    content = content.push(cpu_section(
+        snap,
+        hist,
+        window_secs,
+        window_end_ns,
+        interval_ns,
+    ));
 
     // Memory section (dual series)
-    content = content.push(memory_section(snap, hist, window_secs, window_end_ns));
+    content = content.push(memory_section(
+        snap,
+        hist,
+        window_secs,
+        window_end_ns,
+        interval_ns,
+    ));
 
     // GPU sections
     for gpu in snap.gpus.iter() {
         let gpu_hist = hist.gpu_series.iter().find(|gh| gh.pci_id == gpu.pci_id);
-        content = content.push(gpu_section(gpu, gpu_hist, window_secs, window_end_ns));
+        content = content.push(gpu_section(
+            gpu,
+            gpu_hist,
+            window_secs,
+            window_end_ns,
+            interval_ns,
+        ));
     }
 
     scrollable(container(content).width(Length::Fill))
@@ -210,10 +226,7 @@ pub fn theme(_app: &Lightwatch) -> Theme {
 // panel helper — surface card with border, rounded corners, padding
 // ---------------------------------------------------------------------------
 
-fn panel<'a>(
-    header: Element<'a, Message>,
-    body: Element<'a, Message>,
-) -> Element<'a, Message> {
+fn panel<'a>(header: Element<'a, Message>, body: Element<'a, Message>) -> Element<'a, Message> {
     container(column![header, body].spacing(4))
         .padding(8)
         .style(|_theme| container::Style {
@@ -234,9 +247,10 @@ fn panel<'a>(
 
 fn self_strip(snap: &Snapshot) -> Element<'static, Message> {
     let selfm = &snap.self_metrics;
-    let rss = rfmt(&selfm.rss_kb, |v| {
+    let anon = rfmt(&selfm.rss_anon_kb, |v| {
         format!("{:.1} MiB", *v as f64 / 1024.0)
     });
+    let rss = rfmt(&selfm.rss_kb, |v| format!("{:.1} MiB", *v as f64 / 1024.0));
     let cpu = rfmt(&selfm.cpu_percent, |v| format!("{v:.1}%"));
     let dur = format!("{}us", snap.sample_duration_us);
 
@@ -247,9 +261,17 @@ fn self_strip(snap: &Snapshot) -> Element<'static, Message> {
         Space::new().width(Length::Fill),
         text(dur).size(10).color(theme::TEXT_DIM),
         Space::new().width(8),
-        text(rss).size(10).color(theme::with_alpha(theme::TEXT, 0.6)),
+        text(format!("Anon {}", anon))
+            .size(10)
+            .color(theme::with_alpha(theme::TEXT, 0.6)),
+        Space::new().width(8),
+        text(format!("RSS {}", rss))
+            .size(10)
+            .color(theme::with_alpha(theme::TEXT, 0.4)),
         Space::new().width(12),
-        text(cpu).size(10).color(theme::with_alpha(theme::TEXT, 0.6)),
+        text(cpu)
+            .size(10)
+            .color(theme::with_alpha(theme::TEXT, 0.6)),
     ]
     .align_y(Alignment::Center)
     .spacing(0);
@@ -262,6 +284,7 @@ fn cpu_section(
     hist: &History,
     window_secs: f64,
     window_end_ns: u64,
+    interval_ns: u64,
 ) -> Element<'static, Message> {
     let cpu = &snap.cpu;
     let usage = rfmt(&cpu.usage_percent, |v| format!("{v:.1}%"));
@@ -304,6 +327,7 @@ fn cpu_section(
         });
     }
     chart.window = DrawWindow {
+        sample_interval_ns: interval_ns,
         window_secs,
         window_end_ns,
     };
@@ -324,11 +348,7 @@ fn cpu_section(
         let end = ((col_idx + 1) * per_col).min(n);
         if start >= n {
             // Keep empty columns so the row still distributes full width.
-            legend_cols.push(
-                column![Space::new().height(1)]
-                    .width(Length::Fill)
-                    .into(),
-            );
+            legend_cols.push(column![Space::new().height(1)].width(Length::Fill).into());
             continue;
         }
         let items: Vec<Element<Message>> = cores[start..end]
@@ -350,12 +370,7 @@ fn cpu_section(
                 legend_chip_fixed(&label, color)
             })
             .collect();
-        legend_cols.push(
-            column(items)
-                .spacing(2)
-                .width(Length::Fill)
-                .into(),
-        );
+        legend_cols.push(column(items).spacing(2).width(Length::Fill).into());
     }
 
     let legend = row(legend_cols).spacing(8).width(Length::Fill);
@@ -369,6 +384,7 @@ fn memory_section(
     hist: &History,
     window_secs: f64,
     window_end_ns: u64,
+    interval_ns: u64,
 ) -> Element<'static, Message> {
     let mem = &snap.memory;
     let max_mem = mem.total_kb as f32;
@@ -423,8 +439,8 @@ fn memory_section(
             line_alpha: None,
         });
     }
-
     chart.window = DrawWindow {
+        sample_interval_ns: interval_ns,
         window_secs,
         window_end_ns,
     };
@@ -446,6 +462,7 @@ fn gpu_section(
     gpu_hist: Option<&GpuHistory>,
     window_secs: f64,
     window_end_ns: u64,
+    interval_ns: u64,
 ) -> Element<'static, Message> {
     // Fixed-width value strings so "0.0%" → "100.0%" does not reflow the row.
     let util = rfmt(&gpu.util_percent, |v| format!("{v:5.1}%"));
@@ -491,6 +508,7 @@ fn gpu_section(
             line_alpha: None,
         });
         chart.window = DrawWindow {
+            sample_interval_ns: interval_ns,
             window_secs,
             window_end_ns,
         };
@@ -501,10 +519,7 @@ fn gpu_section(
         body = body.push(canvas);
     }
 
-    panel(
-        header.into(),
-        body.into(),
-    )
+    panel(header.into(), body.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -512,10 +527,7 @@ fn gpu_section(
 // ---------------------------------------------------------------------------
 
 fn section_label(text_str: &str) -> Element<'static, Message> {
-    text(text_str.to_owned())
-        .size(13)
-        .color(theme::TEXT)
-        .into()
+    text(text_str.to_owned()).size(13).color(theme::TEXT).into()
 }
 
 fn rfmt<T: std::fmt::Display>(r: &Reading<T>, f: impl FnOnce(&T) -> String) -> String {
@@ -576,32 +588,14 @@ fn stat_box_fixed(
     .into()
 }
 
-/// A small colored legend chip: a color square + label.
-fn legend_chip(label: &str, color: Color) -> Element<'static, Message> {
-    let label_owned = label.to_owned();
-    let swatch = container(Space::new().width(8).height(8))
-        .style(move |_theme| container::Style {
-            background: Some(iced::Background::Color(color)),
-            ..Default::default()
-        });
-    row![
-        swatch,
-        Space::new().width(4),
-        text(label_owned).size(10).color(theme::TEXT_DIM),
-    ]
-    .align_y(Alignment::Center)
-    .into()
-}
-
 /// Full-width legend chip for the 4-column CPU legend — fills its column so
 /// digit-width changes in the percentage do not shove neighboring chips.
 fn legend_chip_fixed(label: &str, color: Color) -> Element<'static, Message> {
     let label_owned = label.to_owned();
-    let swatch = container(Space::new().width(8).height(8))
-        .style(move |_theme| container::Style {
-            background: Some(iced::Background::Color(color)),
-            ..Default::default()
-        });
+    let swatch = container(Space::new().width(8).height(8)).style(move |_theme| container::Style {
+        background: Some(iced::Background::Color(color)),
+        ..Default::default()
+    });
     row![
         swatch,
         Space::new().width(6),
