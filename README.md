@@ -4,6 +4,8 @@ A Linux system monitor built for leaving open. I like to keep my system monitor 
 
 Rust + [iced](https://iced.rs). Linux only. MIT.
 
+![lightwatch dashboard — CPU, Memory, AMD + NVIDIA GPUs with GSM-style section disclosure](docs/lightwatch-dashboard.png)
+
 ## Quick start
 
 ```bash
@@ -46,6 +48,8 @@ Whether the dGPU reaches `runtime_status=suspended` depends on the platform and 
   - AMD: sysfs (`gpu_busy_percent`, VRAM, hwmon)  
   - NVIDIA: NVML only when sysfs `runtime_status` is **`active`** (fail-closed; will not wake a suspended dGPU)
 - **Self** — private anonymous footprint (RssAnon), total RSS, self CPU%, last sample duration, overruns, skipped ticks. Private footprint answers "what does lightwatch itself own?" while total RSS explains system-monitor differences and GPU mappings.
+- **Layout** — expanded chart panels share the window height equally; scroll only when the window is too short for useful minimums.
+- **Section disclosure** — GSM-style **▾ / ▸** next to each section title collapses/expands the body (header stays with live summary). State is UI-only (sampling continues) and persists in `$XDG_CONFIG_HOME/lightwatch/ui.conf` (or `~/.config/lightwatch/ui.conf`).
 
 **Not in MVP:** process table/kill, network, disk I/O, alerts, plugins, remote, daemons, root-only metrics.
 
@@ -77,11 +81,11 @@ src/
   parse/     /proc/stat, meminfo, loadavg, self/stat, self/status  (pure, tested)
   collect/   cpu, mem, self, gpu/{amd,nvidia}
   sample/    worker (deadline + rings), latest (single slot)
-  ui/        iced view + sparklines
+  ui/        iced view, prefs, sparklines
   diag.rs    --once / --soak
 ```
 
-Layout is TEA-shaped (immutable model, messages, subscription). Collectors stay UI-agnostic.
+Layout is TEA-shaped (immutable model, messages, subscription). Collectors stay UI-agnostic. Section visibility is pure UI state over the same live history.
 
 ## Performance
 
@@ -102,8 +106,9 @@ Targets (engineering goals, measured honestly):
 |------|-------------------------------|------------------|----------------|--------------|
 | `--once` / `--soak` | — | ~0.9 MiB | ~6.5 MiB | ~0.2% self CPU over a short soak |
 | GUI, full 1m history | 66 samples / 70s | 41.61 → 41.62 MiB | 140.01 → 140.01 MiB | 2.35% of one logical CPU |
+| GUI, full 1m (post layout/visibility) | 66 samples / ~75s warm + 30s | RssAnon ~42 MiB | VmRSS ~138 MiB | **2.50%** of one logical CPU |
 
-The measured GUI run uses the release binary, default 1s sampler, and fixed 100ms display wake. It warms for longer than its configured ring capacity, then measures for 60 seconds. CPU is `Δ(utime + stime) / CLK_TCK / Δ/proc/uptime × 100`, so 100% means one fully occupied logical CPU; memory comes from `/proc/<pid>/status`. Ring occupancy and lifetime overrun/skip totals are not externally exposed by the current GUI, so the fill claim is based on the deadline schedule plus the stated capacity/warm-up rather than a separately captured occupancy counter.
+The measured GUI run uses the release binary, default 1s sampler, and fixed 100ms display wake. It warms for longer than its configured ring capacity, then measures for 30–60 seconds. CPU is `Δ(utime + stime) / CLK_TCK / Δ/proc/uptime × 100`, so 100% means one fully occupied logical CPU; memory comes from `/proc/<pid>/status`. Ring occupancy and lifetime overrun/skip totals are not externally exposed by the current GUI, so the fill claim is based on the deadline schedule plus the stated capacity/warm-up rather than a separately captured occupancy counter. The post-layout remeasure is consistent with the prior ~2.3–2.5% band (no cadence change); hot-path optimization remains deferred pending a profiler-identified win.
 
 The unstripped release binary is about 22 MiB on disk.
 
