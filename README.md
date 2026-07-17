@@ -2,6 +2,8 @@
 
 A Linux system monitor built for leaving open. I like to keep my system monitor open continuously but the one that came with my distro had an occasional memory leak so I figured this was a good excuse to learn [Iced](https://iced.rs).
 
+Lightwatch's warm default settles under 30 MiB of resident private memory on my machine, versus roughly 80–100 MiB—and often more—for GNOME System Monitor.
+
 Rust + [iced](https://iced.rs). Linux only. MIT.
 
 ![lightwatch dashboard — CPU, Memory, AMD + NVIDIA GPUs with GSM-style section disclosure](docs/lightwatch-dashboard.png)
@@ -26,19 +28,17 @@ Needs a recent stable Rust. GUI wants Wayland or X11. NVIDIA metrics need `libnv
 
 ## GPU power posture (iGPU default)
 
-Lightwatch pins its UI compositor (iced/wgpu) to the integrated GPU by default so the GUI does not wake a suspended or idle discrete GPU:
+Lightwatch keeps its iced/wgpu compositor on the integrated AMD GPU by default. When `WGPU_POWER_PREF`, `VK_ICD_FILENAMES`, and `WGPU_BACKEND` are all absent and the Radeon ICD exists, startup sets `low`, the Radeon ICD path, and `vulkan` as one bundle. This avoids loading the unused GL renderer path. If the Radeon ICD is missing, only the soft `low` preference is set.
 
-- On startup, if **neither** `WGPU_POWER_PREF` nor `VK_ICD_FILENAMES` is already set in the environment, lightwatch sets both:
-  - `WGPU_POWER_PREF=low` (soft wgpu adapter preference), and
-  - `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json` (hard ICD filter; only set when the radeon ICD file exists).
-- If you set **either** env var yourself (including `WGPU_POWER_PREF=high`), lightwatch leaves both alone — you are in full control. Set both to override completely (e.g., force NVIDIA), or unset both to get the automatic iGPU default.
-- The hard bar: with the default bundle applied, lightwatch renders on the AMD GPU. NVIDIA metrics are gated by the dGPU's sysfs `runtime_status` before any NVML operation — when the dGPU is suspended, telemetry becomes `Unavailable` and the rest of the UI remains functional. Active-state NVML failures clear the cache and may retry on a later sample; lightwatch never writes power controls.
-- **Renderer and NVML are separate namespaces:** renderer DRM/render-node descriptors map to their backing PCI device through sysfs (major/minor → device path → PCI address). NVIDIA `/dev/nvidia*` descriptors are NVML driver handles, not renderer selection — they are permitted only when the dGPU was already active for another reason, and they are counted and reported independently. Do not correlate DRM and NVML by ordinal card number.
-- On machines with a broken radv install, the `VK_ICD_FILENAMES` filter can prevent iced from finding an adapter at all. Simply unsetting `VK_ICD_FILENAMES` with `env -u` is not enough — both vars would then be absent and the default bundle would fire again on next launch. Recovery: set **either** env var to a present value (disabling the whole atomic bundle) **and** clear any stale `VK_ICD_FILENAMES` from a prior launch, e.g.:  
-  `WGPU_POWER_PREF=low env -u VK_ICD_FILENAMES cargo run --release`  
-  (or `WGPU_POWER_PREF=high`, or set `VK_ICD_FILENAMES` to a full ICD list). WGPU and the system ICD loader will then enumerate adapters normally.
+Setting **any one** of those three variables disables the whole automatic bundle; Lightwatch never mixes its defaults with user GPU configuration. To recover through GL, explicitly own the backend and power preference while clearing a stale ICD filter:
 
-Whether the dGPU reaches `runtime_status=suspended` depends on the platform and PRIME configuration. When it is already active, NVML legitimately opens `/dev/nvidia*` descriptors; those do not imply that the UI renderer selected NVIDIA.
+```bash
+env -u VK_ICD_FILENAMES WGPU_BACKEND=gl WGPU_POWER_PREF=low cargo run --release
+```
+
+That recovery path may enumerate or wake a discrete GPU. Renderer DRM descriptors and NVIDIA NVML telemetry descriptors are separate: `/dev/nvidia*` may be open when an already-active dGPU is sampled without meaning the UI renders there. NVML is gated by sysfs `runtime_status`; Lightwatch never writes GPU power controls.
+
+Separately, Lightwatch defaults iced's Tokio runtime to one worker. Set `TOKIO_WORKER_THREADS` before launch to choose another size.
 
 ## What it shows
 
@@ -89,39 +89,37 @@ Layout is TEA-shaped (immutable model, messages, subscription). Collectors stay 
 
 ## Performance
 
-Targets (engineering goals, measured honestly):
+The design keeps work and storage bounded: one sampler thread, one Tokio worker by default, a single-slot snapshot handoff, fixed-capacity history, no steady-state subprocesses, and a 100 ms display wake independent of the 1 Hz sampler.
 
-| | Goal |
-|--|------|
-| Sample cadence | 1 Hz default |
-| Headless RSS | small; flat at fixed config |
-| GUI RSS | aim &lt; 100 MiB after warmup (see measured) |
-| Idle CPU | ≪ 1 core |
-| History | constant for a given window |
-| Steady-state subprocesses | none |
+Measured on Pop!_OS 24.04 COSMIC Wayland, Ryzen 7 6800HS, AMD 680M + RTX 3050 Mobile, using the optimized GUI after its 66-sample history filled. Swap is the value during this measurement window, not a promise that the kernel will never page out cold memory:
 
-**Measured** (Pop!_OS 24.04 COSMIC Wayland, Ryzen 7 6800HS 16 threads, ~28 GiB, AMD 680M + RTX 3050 Mobile):
+| Resident private (`RssAnon`) | Total RSS | Threads | Swap | CPU |
+|------------------------------|-----------|---------|------|-----|
+| 28.7 MiB | 88.8 MiB | 7 | 0 | 0.68% of one logical CPU |
 
-| Mode | Configured capacity / warm-up | Anon start → end | RSS start → end | CPU over 60s |
-|------|-------------------------------|------------------|----------------|--------------|
-| `--once` / `--soak` | — | ~0.9 MiB | ~6.5 MiB | ~0.2% self CPU over a short soak |
-| GUI, full 1m history | 66 samples / 70s | 41.61 → 41.62 MiB | 140.01 → 140.01 MiB | 2.35% of one logical CPU |
-| GUI, full 1m (post layout/visibility) | 66 samples / ~75s warm + 30s | RssAnon ~42 MiB | VmRSS ~138 MiB | **2.50%** of one logical CPU |
+`RssAnon` is resident anonymous memory owned by the process; `RssAnon + VmSwap` is the better leak signal once the kernel starts paging out cold memory. Total RSS also includes shared/file-backed mappings, which is why system monitors can show a much larger resident number. The renderer descriptors mapped to AMD PCI `0000:04:00.0`; NVIDIA descriptors belonged to telemetry for the already-active dGPU.
 
-The measured GUI run uses the release binary, default 1s sampler, and fixed 100ms display wake. It warms for longer than its configured ring capacity, then measures for 30–60 seconds. CPU is `Δ(utime + stime) / CLK_TCK / Δ/proc/uptime × 100`, so 100% means one fully occupied logical CPU; memory comes from `/proc/<pid>/status`. Ring occupancy and lifetime overrun/skip totals are not externally exposed by the current GUI, so the fill claim is based on the deadline schedule plus the stated capacity/warm-up rather than a separately captured occupancy counter. The post-layout remeasure is consistent with the prior ~2.3–2.5% band (no cadence change); hot-path optimization remains deferred pending a profiler-identified win.
+The private footprint also stayed around 29.5–30.3 MiB with zero swap during a separate 50-minute candidate run. Headless `--once` / `--soak` remains about 0.9 MiB anonymous and 6.5 MiB total RSS on this machine.
 
-The unstripped release binary is about 22 MiB on disk.
+During later compiler pressure, the kernel moved 25.9 MiB of the same process's cold private pages to swap while resident private memory fell to 4.2 MiB; `RssAnon + VmSwap` remained about 30.1 MiB. Swap by itself is therefore not a leak signal—watch whether the combined private footprint keeps growing.
 
-**Synthetic geometry** (release mode, 256 series × 7 200 points, 700px plot): a gap-free series produces 785 Bézier segments against a derived 794-segment bound. The 256-series bursty-gap case produced 1,172 segments/series in 23.4ms; pathological sub-pixel fragmentation produced no drawable segments after preserving and coalescing its gaps. The fully fragmented hard bound is 7,181 segments/series (the ring capacity remains the final cap), while ordinary gap-free CPU history is pixel-bounded.
+A paired GNOME System Monitor process-details capture after that reclamation showed:
 
-UI wakes on a **100 ms** timer; the sampler thread runs on a deadline schedule at the configured cadence (1 s default). Charts use a two-interval diagnostic look-ahead (`window_end = boottime_now − 2 × interval`) so the next two known samples sit off-screen right. X scrolls uniformly and the clipped entrance/exit geometry is final at reveal. Display cadence is uncoupled from sample cadence.
+| Displayed metric | Lightwatch | GNOME System Monitor | Lightwatch share |
+|------------------|------------|----------------------|------------------|
+| Memory | 4.2 MiB | 78.9 MiB | 5.3% |
+| Resident Memory | 63.1 MiB | 211.8 MiB | 29.8% |
+| Shared Memory | 58.9 MiB | 132.9 MiB | 44.3% |
+| Virtual Memory | 764.3 MiB | 2.5 GiB | ~29.9% |
+| CPU at capture | 0.13% | 0.80% | 16.3% |
 
-**Verified:** the release GUI renderer descriptors all mapped through DRM `226:128` to AMD PCI `0000:04:00.0`. The already-active NVIDIA GPU opened six separate NVML descriptors (`nvidiactl`, `nvidia0`, and `nvidia-uvm`). Automated tests cover two clip strips through multiple arrivals/evictions with and without decimation, jittered timestamps, and edge-adjacent gaps.
+In both windows, GNOME's displayed `Memory` is exactly `Resident Memory − Shared Memory`. It therefore excludes Lightwatch's swapped pages: the 4.2 MiB display is a resident number, while the contemporaneous `RssAnon + VmSwap` value was 30.1 MiB. Even that combined Lightwatch value was only about 38% of GNOME System Monitor's resident-private figure. Virtual memory is reserved address space rather than physical RAM, and the CPU row is an instantaneous reading; the 60-second 0.68% measurement above is the steadier Lightwatch result.
 
-**Deferred:** the full 60-minute-history GUI measurement was not run in this batch. Natural suspended-dGPU verification also remains hardware-state dependent; the current compositor kept NVIDIA `active`.
+Release-mode geometry stress tests cover 256 series × 7,200 points. Ordinary gap-free history is pixel-bounded; the ring capacity remains the hard bound for fragmented input. The 256-series bursty case completes in roughly 22 ms on this machine.
 
 ## Why numbers differ from GNOME System Monitor
 
+- **Process memory** — GNOME's process-details `Memory` is resident minus shared in these captures. It excludes swapped-out private pages; use `RssAnon + VmSwap` when looking for growth over time.
 - **Memory “used”** — we use `MemTotal − MemAvailable`. GNOME often reports a different used/cache split; totals and “pressure” semantics won’t match line-for-line.
 - **CPU** — overall % is from the aggregate `cpu` line; GNOME’s multi-core view weights cores visually. Sampling phase and window also differ.
 - **VRAM / GPU** — different sources (sysfs vs NVML vs GNOME’s path) and units.

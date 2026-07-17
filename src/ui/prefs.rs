@@ -124,10 +124,8 @@ pub fn parse_ui_conf(text: &str) -> SectionVisibility {
                     v.show_memory = b;
                 }
             }
-            "hide_gpu" => {
-                if !val.is_empty() {
-                    v.hidden_gpus.insert(val.to_string());
-                }
+            "hide_gpu" if !val.is_empty() => {
+                v.hidden_gpus.insert(val.to_string());
             }
             _ => {} // unknown keys ignored
         }
@@ -246,8 +244,10 @@ show_cpu=maybe
 
     #[test]
     fn format_round_trip() {
-        let mut v = SectionVisibility::default();
-        v.show_cpu = false;
+        let mut v = SectionVisibility {
+            show_cpu: false,
+            ..Default::default()
+        };
         v.hidden_gpus.insert("0000:01:00.0".to_string());
         let text = format_ui_conf(&v);
         let back = parse_ui_conf(&text);
@@ -318,8 +318,10 @@ show_cpu=maybe
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ui.conf");
-        let mut v = SectionVisibility::default();
-        v.show_memory = false;
+        let mut v = SectionVisibility {
+            show_memory: false,
+            ..Default::default()
+        };
         v.hidden_gpus.insert("0000:0a:00.0".to_string());
         save_ui_prefs_to(&path, &v).unwrap();
         let loaded = load_ui_prefs_from(&path);

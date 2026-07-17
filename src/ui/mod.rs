@@ -21,29 +21,34 @@ const RADEON_ICD_PATH: &str = "/usr/share/vulkan/icd.d/radeon_icd.json";
 struct GpuEnvBundle {
     pub(super) power_pref: Option<&'static str>,
     pub(super) vk_icd_filenames: Option<&'static str>,
+    pub(super) backend: Option<&'static str>,
 }
 
 /// Pure decision: propose the atomic default bundle only when the user
-/// has not set either `WGPU_POWER_PREF` or `VK_ICD_FILENAMES`.
+/// has not set any of `WGPU_POWER_PREF`, `VK_ICD_FILENAMES`, or
+/// `WGPU_BACKEND`.
 ///
-/// - Both vars set to `None` (truly absent) AND radeon ICD file exists →
-///   propose `WGPU_POWER_PREF=low` + `VK_ICD_FILENAMES=<radeon path>`.
-/// - Either var is `Some(_)` (including non-Unicode) → propose nothing;
+/// - All three vars set to `None` (truly absent) AND radeon ICD file exists →
+///   propose `WGPU_POWER_PREF=low` + `VK_ICD_FILENAMES=<radeon path>` +
+///   `WGPU_BACKEND=vulkan`.
+/// - Any managed var is `Some(_)` (including non-Unicode) → propose nothing;
 ///   the user is managing GPU selection.
-/// - Both absent but radeon ICD missing → propose only `WGPU_POWER_PREF=low`.
+/// - All absent but radeon ICD missing → propose only `WGPU_POWER_PREF=low`.
 ///
 /// This function is pure (no environment mutation) and testable.
 fn propose_gpu_env(
     power_pref: Option<&OsStr>,
     vk_icd: Option<&OsStr>,
+    backend: Option<&OsStr>,
     radeon_icd_exists: bool,
 ) -> GpuEnvBundle {
-    // If the user has set either var at all, the default bundle is disabled
+    // If the user has set any managed var, the default bundle is disabled
     // entirely — we never override or mix with user config.
-    if power_pref.is_some() || vk_icd.is_some() {
+    if power_pref.is_some() || vk_icd.is_some() || backend.is_some() {
         return GpuEnvBundle {
             power_pref: None,
             vk_icd_filenames: None,
+            backend: None,
         };
     }
     GpuEnvBundle {
@@ -53,7 +58,14 @@ fn propose_gpu_env(
         } else {
             None
         },
+        backend: radeon_icd_exists.then_some("vulkan"),
     }
+}
+
+/// Use one Tokio worker unless the user has chosen a runtime size explicitly.
+/// This policy is independent of GPU selection.
+fn propose_tokio_worker_threads(current: Option<&OsStr>) -> Option<&'static str> {
+    current.is_none().then_some("1")
 }
 
 /// Apply the GPU pin decision at startup (before any threads or wgpu init).
@@ -69,6 +81,7 @@ fn apply_gpu_env() {
     let bundle = propose_gpu_env(
         std::env::var_os("WGPU_POWER_PREF").as_deref(),
         std::env::var_os("VK_ICD_FILENAMES").as_deref(),
+        std::env::var_os("WGPU_BACKEND").as_deref(),
         radeon_exists,
     );
     if let Some(v) = bundle.power_pref {
@@ -83,6 +96,23 @@ fn apply_gpu_env() {
             std::env::set_var("VK_ICD_FILENAMES", v);
         }
     }
+    if let Some(v) = bundle.backend {
+        // SAFETY: single-threaded startup — see fn doc.
+        unsafe {
+            std::env::set_var("WGPU_BACKEND", v);
+        }
+    }
+}
+
+/// Apply the bounded executor default during single-threaded startup.
+fn apply_tokio_worker_env() {
+    let value = propose_tokio_worker_threads(std::env::var_os("TOKIO_WORKER_THREADS").as_deref());
+    if let Some(v) = value {
+        // SAFETY: called before iced creates its Tokio runtime or any thread.
+        unsafe {
+            std::env::set_var("TOKIO_WORKER_THREADS", v);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -90,8 +120,8 @@ fn apply_gpu_env() {
 // ---------------------------------------------------------------------------
 
 pub fn run_gui(config: HistoryConfig) -> iced::Result {
-    // Pin GPU preference before any threads or wgpu adapter probe.
-    // See apply_gpu_env safety doc.
+    // Bound the executor and pin GPU preference before iced creates either.
+    apply_tokio_worker_env();
     apply_gpu_env();
 
     let boot_config = config.clone();
@@ -116,45 +146,56 @@ pub fn run_gui(config: HistoryConfig) -> iced::Result {
 mod tests {
     use super::*;
 
-    // A small helper to build a fake OsStr from a &str for the propose_gpu_env
-    // calls in tests.
+    // A small helper to build a fake OsStr from a &str for pure env decisions.
     fn os(s: &str) -> Option<&OsStr> {
         Some(OsStr::new(s))
     }
 
     #[test]
-    fn both_unset_icd_exists_proposes_both() {
-        let b = propose_gpu_env(None, None, true);
+    fn all_unset_icd_exists_proposes_full_bundle() {
+        let b = propose_gpu_env(None, None, None, true);
         assert_eq!(b.power_pref, Some("low"));
         assert_eq!(b.vk_icd_filenames, Some(RADEON_ICD_PATH));
+        assert_eq!(b.backend, Some("vulkan"));
     }
 
     #[test]
-    fn both_unset_icd_missing_proposes_power_pref_only() {
-        let b = propose_gpu_env(None, None, false);
+    fn all_unset_icd_missing_proposes_power_pref_only() {
+        let b = propose_gpu_env(None, None, None, false);
         assert_eq!(b.power_pref, Some("low"));
         assert_eq!(b.vk_icd_filenames, None);
+        assert_eq!(b.backend, None);
+    }
+
+    fn assert_gpu_bundle_blocked(
+        power_pref: Option<&OsStr>,
+        vk_icd: Option<&OsStr>,
+        backend: Option<&OsStr>,
+    ) {
+        let b = propose_gpu_env(power_pref, vk_icd, backend, true);
+        assert_eq!(
+            b,
+            GpuEnvBundle {
+                power_pref: None,
+                vk_icd_filenames: None,
+                backend: None,
+            }
+        );
     }
 
     #[test]
     fn power_pref_set_blocks_bundle() {
-        let b = propose_gpu_env(os("high"), None, true);
-        assert_eq!(b.power_pref, None);
-        assert_eq!(b.vk_icd_filenames, None);
+        assert_gpu_bundle_blocked(os("high"), None, None);
     }
 
     #[test]
     fn vk_icd_set_blocks_bundle() {
-        let b = propose_gpu_env(None, os("/fake/icd.json"), true);
-        assert_eq!(b.power_pref, None);
-        assert_eq!(b.vk_icd_filenames, None);
+        assert_gpu_bundle_blocked(None, os("/fake/icd.json"), None);
     }
 
     #[test]
-    fn both_set_blocks_bundle() {
-        let b = propose_gpu_env(os("high"), os("/fake/icd.json"), true);
-        assert_eq!(b.power_pref, None);
-        assert_eq!(b.vk_icd_filenames, None);
+    fn backend_set_blocks_bundle() {
+        assert_gpu_bundle_blocked(None, None, os("gl"));
     }
 
     #[test]
@@ -163,8 +204,30 @@ mod tests {
         // var_os returning Some(non-unicode) must count as "set".
         use std::os::unix::ffi::OsStrExt;
         let raw = OsStr::from_bytes(b"\xFF\xFE");
-        let b = propose_gpu_env(Some(raw), None, true);
-        assert_eq!(b.power_pref, None);
-        assert_eq!(b.vk_icd_filenames, None);
+        assert_gpu_bundle_blocked(Some(raw), None, None);
+    }
+
+    #[test]
+    fn all_gpu_vars_set_with_non_unicode_backend_blocks_bundle() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = OsStr::from_bytes(b"\xFF\xFE");
+        assert_gpu_bundle_blocked(os("high"), os("/fake/icd.json"), Some(raw));
+    }
+
+    #[test]
+    fn tokio_workers_unset_proposes_one() {
+        assert_eq!(propose_tokio_worker_threads(None), Some("1"));
+    }
+
+    #[test]
+    fn tokio_workers_set_is_preserved() {
+        assert_eq!(propose_tokio_worker_threads(os("4")), None);
+    }
+
+    #[test]
+    fn non_unicode_tokio_workers_is_preserved() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = OsStr::from_bytes(b"\xFF\xFE");
+        assert_eq!(propose_tokio_worker_threads(Some(raw)), None);
     }
 }

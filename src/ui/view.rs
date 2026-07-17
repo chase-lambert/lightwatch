@@ -5,7 +5,9 @@ use super::theme;
 use crate::model::*;
 use crate::sample::latest::{Latest, Published};
 use crate::sample::worker::Sampler;
-use iced::widget::{Canvas, Space, button, column, container, responsive, row, scrollable, text};
+use iced::widget::{
+    Canvas, Space, button, column, container, responsive, row, scrollable, text, tooltip,
+};
 use iced::{Alignment, Color, Element, Length, Size, Subscription, Theme};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -654,7 +656,13 @@ fn memory_section(
 
     let body = if expanded {
         let stats = row![
-            stat_box("Used", used, theme::ACCENT_MEM),
+            tooltip(
+                stat_box("Used", used, theme::ACCENT_MEM),
+                container(text("Used = Total − Available").size(11).color(theme::TEXT))
+                    .padding([4, 6])
+                    .style(container::rounded_box),
+                tooltip::Position::Bottom,
+            ),
             Space::new().width(6),
             stat_box("Avail", avail, theme::ACCENT_MEM),
             Space::new().width(6),
