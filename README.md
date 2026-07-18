@@ -23,6 +23,8 @@ cargo run --release -- --soak 30 # headless RSS/CPU soak
 | `--soak SECS` | | Headless sample loop + summary |
 | `--interval MS` | `1000` | Sample period (100 ms–60 s) |
 | `--history SECS` | `60` | Graph window (≤ 2 h; capacity = window ÷ interval + 6 edge samples) |
+| `-h`, `--help` | | Flag summary, then exit |
+| `-V`, `--version` | | Version, then exit |
 
 Needs a recent stable Rust. GUI wants Wayland or X11. NVIDIA metrics need `libnvidia-ml` (driver package); without it, other panels still work.
 

@@ -6,10 +6,8 @@ license = "MIT"
 
 [dependencies]
 iced = { version = "0.14", default-features = false, features = ["tokio", "canvas", "crisp", "wayland", "x11", "wgpu"] }
-clap = { version = "4", features = ["derive"] }
 nvml-wrapper = "0.12"
 libc = "0.2"
-thiserror = "2"
 
 [dev-dependencies]
 proptest = "1"
