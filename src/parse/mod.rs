@@ -1,15 +1,21 @@
 pub mod loadavg;
 pub mod meminfo;
+pub mod mounts;
+pub mod nvme_smart;
 pub mod pid_io;
 pub mod pid_stat;
+pub mod power_supply;
 pub mod proc_stat;
 pub mod self_stat;
 pub mod self_status;
 
 pub use loadavg::*;
 pub use meminfo::*;
+pub use mounts::*;
+pub use nvme_smart::*;
 pub use pid_io::*;
 pub use pid_stat::*;
+pub use power_supply::*;
 pub use proc_stat::*;
 pub use self_stat::*;
 pub use self_status::*;

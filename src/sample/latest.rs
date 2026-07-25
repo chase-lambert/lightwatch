@@ -103,6 +103,7 @@ mod tests {
                     ticks_skipped: 0,
                 },
                 processes: vec![],
+                health: crate::model::HealthSnapshot::default(),
             },
             history: History::new(&HistoryConfig::default_config(), &[], &[]),
         })

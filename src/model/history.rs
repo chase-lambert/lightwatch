@@ -513,6 +513,8 @@ pub struct Snapshot {
     pub self_metrics: SelfSnapshot,
     /// Userspace processes for the Processes tab (latest-only; no rings).
     pub processes: Vec<crate::model::process::ProcessRow>,
+    /// Storage + battery condition for the Health tab (latest-only; no rings).
+    pub health: crate::model::health::HealthSnapshot,
 }
 
 // ---------------------------------------------------------------------------

@@ -44,12 +44,13 @@ NVML telemetry is orthogonal and fail-closed on sysfs `runtime_status` (never wa
 
 ## What it shows
 
-Tabs: **Resources** (default) · **Processes** · **Health** (placeholder).
+Tabs: **Resources** (default) · **Processes** · **Health**.
 
 - **CPU** — overall %, temp, freq; multi-series per-core overlay (up to 256 cores; 16-color palette wraps)
 - **Memory / swap** — used/swap charts; Used, Avail, Swap, Load 1/5/15 chips (`used = MemTotal − MemAvailable`)
 - **GPUs** — by PCI BDF; AMD via sysfs; NVIDIA via NVML only when `runtime_status` is **active**
 - **Processes** — full userspace list (sort Memory ↓ by default). Name (exe basename + Electron `(type)`), % CPU as share of **total** machine capacity, Memory as **RssAnon**, disk read/write totals, ID. Search by name or pid prefix. **End Process** = SIGTERM after `pid+starttime` check; Chromium helpers walk to the app root first
+- **Health** — condition (not live load): block-backed mounts (used · available + fill bar); physical drive cards (model, kind, size, temp; NVMe wear when SMART is readable, silent otherwise); batteries (system first: charge % · health % · cycles; peripherals: name · %). No charging/AC status. Refreshed every 5 s
 - **Layout** — expanded Resource panels share height equally; GSM-style **▾ / ▸** disclosure; prefs in `$XDG_CONFIG_HOME/lightwatch/ui.conf` (or `~/.config/lightwatch/ui.conf`)
 
 **Not in MVP:** network, disk I/O dashboards, alerts, plugins, remote, daemons, process tree, SIGKILL escalate.
@@ -65,7 +66,7 @@ UI (iced)  ←── notify + pull latest Arc ──  Sampler thread
 
 | Idea | Rule |
 |------|------|
-| Snapshots | Immutable each tick; process rows latest-only (no rings) |
+| Snapshots | Immutable each tick; process + health rows latest-only (no rings) |
 | History | Fixed rings; `capacity = floor(window/interval) + 6` ≤ **7206** |
 | Charts | Two-interval look-ahead; pixel-stable edges; gaps stay gaps |
 | Handoff | Single-slot latest; never a queue |
@@ -76,9 +77,9 @@ UI (iced)  ←── notify + pull latest Arc ──  Sampler thread
 
 ```
 src/
-  model/     Snapshot, History, ProcessRow, name helpers
-  parse/     /proc parsers (pure, tested)
-  collect/   cpu, mem, self, proc, gpu/{amd,nvidia}
+  model/     Snapshot, History, ProcessRow, HealthSnapshot, name helpers
+  parse/     /proc parsers + mounts, power_supply, nvme_smart (pure, tested)
+  collect/   cpu, mem, self, proc, health, gpu/{amd,nvidia}
   sample/    worker + latest
   ui/        tabs, prefs, sparklines
   diag.rs    --once / --soak

@@ -1,5 +1,6 @@
 use super::latest::{Latest, Published};
 use crate::collect::gpu::{self, GpuDevice, amd, nvidia};
+use crate::collect::health::{HEALTH_REFRESH_NS, HealthCollector};
 use crate::collect::proc::ProcessCollector;
 use crate::collect::{cpu::CpuCollector, mem::MemCollector, self_metrics::SelfCollector};
 use crate::model::*;
@@ -52,12 +53,15 @@ pub struct Sampler {
     mem_collector: MemCollector,
     self_collector: SelfCollector,
     process_collector: ProcessCollector,
+    health_collector: HealthCollector,
     history: History,
     gpu_devices: Vec<GpuDevice>,
     seq: u64,
     overruns: u64,
     skipped: u64,
-    last_discovery_ns: u64,      // boottime of last GPU discovery
+    last_discovery_ns: u64, // boottime of last GPU discovery
+    last_health_ns: u64,    // boottime of last health refresh
+    health_cache: HealthSnapshot,
     prev_t_boot_ns: Option<u64>, // previous sample's boottime for gap detection
     #[allow(dead_code)]
     core_count: usize,
@@ -83,6 +87,7 @@ impl Sampler {
             mem_collector: MemCollector::new("/proc"),
             self_collector: SelfCollector::new("/proc"),
             process_collector: ProcessCollector::new("/proc"),
+            health_collector: HealthCollector::new("/proc", "/sys", "/dev"),
             config,
             latest,
             notify,
@@ -93,6 +98,8 @@ impl Sampler {
             overruns: 0,
             skipped: 0,
             last_discovery_ns: 0,
+            last_health_ns: 0,
+            health_cache: HealthSnapshot::default(),
             prev_t_boot_ns: None,
             core_count: core_ids.len(),
             last_authoritative_core_count: core_ids.len(),
@@ -216,6 +223,16 @@ impl Sampler {
             let t_boot_ns = crate::clock_boottime_ns();
             // Process CPU% wall time uses the snapshot boottime stamp.
             let processes = self.process_collector.sample(t_boot_ns);
+
+            // Health condition: refresh on a slower cadence; republish cache otherwise.
+            if self.last_health_ns == 0
+                || t_boot_ns.saturating_sub(self.last_health_ns) >= HEALTH_REFRESH_NS
+            {
+                self.last_health_ns = t_boot_ns;
+                self.health_cache = self.health_collector.sample();
+            }
+            let health = self.health_cache.clone();
+
             let sample_dur = sample_start.elapsed();
             self.prev_t_boot_ns = Some(t_boot_ns);
 
@@ -230,6 +247,7 @@ impl Sampler {
                 gpus: gpu_snaps,
                 self_metrics: self_snap,
                 processes,
+                health,
             };
 
             // Push to history rings
@@ -555,6 +573,7 @@ pub fn sample_once(config: &HistoryConfig) -> Result<Snapshot, String> {
     let mem = MemCollector::new("/proc");
     let mut self_coll = SelfCollector::new("/proc");
     let mut process_coll = ProcessCollector::new("/proc");
+    let health_coll = HealthCollector::new("/proc", "/sys", "/dev");
     let gpu_devices = gpu::discover("/sys");
 
     // Take baseline, wait, take second sample for deltas
@@ -601,6 +620,7 @@ pub fn sample_once(config: &HistoryConfig) -> Result<Snapshot, String> {
 
     let t_boot_ns = crate::clock_boottime_ns();
     let processes = process_coll.sample(t_boot_ns);
+    let health = health_coll.sample();
 
     Ok(Snapshot {
         seq: 1,
@@ -613,6 +633,7 @@ pub fn sample_once(config: &HistoryConfig) -> Result<Snapshot, String> {
         gpus: gpu_snaps,
         self_metrics: self_snap,
         processes,
+        health,
     })
 }
 

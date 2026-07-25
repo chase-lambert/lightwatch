@@ -104,6 +104,82 @@ fn print_snapshot(snap: &Snapshot) {
     println!("  duration: {} µs", snap.sample_duration_us);
     println!("  overruns: {}", snap.sampler_overruns);
     println!("  skipped:  {}", snap.ticks_skipped);
+    println!();
+
+    // Health (condition)
+    println!("Health:");
+    match &snap.health.mounts {
+        Reading::Value(mounts) => {
+            for m in mounts {
+                println!(
+                    "  mount {}: {} used · {} avail ({:.0}%)",
+                    m.mountpoint,
+                    bytes_to_human(m.used_bytes),
+                    bytes_to_human(m.available_bytes),
+                    m.use_percent
+                );
+            }
+            if mounts.is_empty() {
+                println!("  mounts:   (none)");
+            }
+        }
+        Reading::Unavailable { reason } => println!("  mounts:   unavailable ({reason})"),
+    }
+    match &snap.health.drives {
+        Reading::Value(drives) => {
+            for d in drives {
+                let size = match &d.size_bytes {
+                    Reading::Value(b) => bytes_to_human(*b),
+                    Reading::Unavailable { .. } => "?".into(),
+                };
+                let temp = match &d.temp_celsius {
+                    Reading::Value(t) => format!("{t:.0}°C"),
+                    Reading::Unavailable { .. } => "—".into(),
+                };
+                let wear = match &d.wear_percent_used {
+                    Reading::Value(w) => format!(" wear {w}%"),
+                    Reading::Unavailable { .. } => String::new(),
+                };
+                println!(
+                    "  drive {}: {} · {} · {} · {temp}{wear}",
+                    d.name,
+                    d.model,
+                    d.kind.label(),
+                    size
+                );
+            }
+            if drives.is_empty() {
+                println!("  drives:   (none)");
+            }
+        }
+        Reading::Unavailable { reason } => println!("  drives:   unavailable ({reason})"),
+    }
+    match &snap.health.batteries {
+        Reading::Value(bats) => {
+            for b in bats {
+                let charge = match &b.charge_percent {
+                    Reading::Value(p) => format!("{p:.0}%"),
+                    Reading::Unavailable { .. } => match &b.capacity_level {
+                        Reading::Value(l) => l.clone(),
+                        Reading::Unavailable { .. } => "—".into(),
+                    },
+                };
+                let health = match &b.health_percent {
+                    Reading::Value(h) => format!(" health {h:.0}%"),
+                    Reading::Unavailable { .. } => String::new(),
+                };
+                let cycles = match &b.cycle_count {
+                    Reading::Value(c) => format!(" · {c} cycles"),
+                    Reading::Unavailable { .. } => String::new(),
+                };
+                println!("  battery {}: {charge}{health}{cycles}", b.label);
+            }
+            if bats.is_empty() {
+                println!("  batteries:(none)");
+            }
+        }
+        Reading::Unavailable { reason } => println!("  batteries: unavailable ({reason})"),
+    }
 }
 
 fn println_reading<T: std::fmt::Display, F: FnOnce(&T) -> String>(

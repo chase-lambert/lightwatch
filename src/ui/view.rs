@@ -364,7 +364,7 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
     let body: Element<'_, Message> = match app.active_tab {
         AppTab::Resources => resources_body(app, snap, &published.history),
         AppTab::Processes => processes_body(app, snap),
-        AppTab::Health => health_body(),
+        AppTab::Health => health_body(snap),
     };
 
     // Extra air between the tab chrome and the first panel (CPU / table / health).
@@ -467,13 +467,10 @@ fn process_search_trailing(app: &Lightwatch, match_count: usize) -> Element<'_, 
         .size(12)
         .width(Length::Fixed(220.0));
 
-    row![
-        text(count_label).size(11).color(theme::TEXT_DIM),
-        search,
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center)
-    .into()
+    row![text(count_label).size(11).color(theme::TEXT_DIM), search,]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 fn resources_body<'a>(
@@ -521,21 +518,257 @@ fn resources_body<'a>(
     .into()
 }
 
-fn health_body() -> Element<'static, Message> {
-    container(
-        column![
-            text("System health").size(16).color(theme::TEXT),
-            text("Reserved for a later pass.")
-                .size(12)
-                .color(theme::TEXT_DIM),
-        ]
-        .spacing(8)
-        .align_x(Alignment::Center),
+fn health_body(snap: &Snapshot) -> Element<'static, Message> {
+    let storage = health_storage_panel(&snap.health);
+    let battery = health_battery_panel(&snap.health);
+    // A little air under Battery so the last card isn't hard against the window edge.
+    scrollable(
+        column![storage, battery, Space::new().height(10.0)]
+            .spacing(SECTION_GAP)
+            .width(Length::Fill)
+            .padding(iced::Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 4.0,
+                left: 0.0,
+            }),
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    .align_x(Alignment::Center)
+    .into()
+}
+
+fn health_storage_panel(health: &crate::model::HealthSnapshot) -> Element<'static, Message> {
+    let mut body_items: Vec<Element<'static, Message>> = Vec::new();
+
+    match &health.mounts {
+        Reading::Value(mounts) if !mounts.is_empty() => {
+            for m in mounts {
+                body_items.push(mount_row(m));
+            }
+        }
+        Reading::Value(_) => {
+            body_items.push(
+                text("No data mounts")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            );
+        }
+        Reading::Unavailable { .. } => {
+            // Quiet: enumeration failed — omit mount list noise.
+        }
+    }
+
+    match &health.drives {
+        Reading::Value(drives) if !drives.is_empty() => {
+            if !body_items.is_empty() {
+                body_items.push(Space::new().height(6).into());
+            }
+            for d in drives {
+                body_items.push(drive_row(d));
+            }
+        }
+        _ => {}
+    }
+
+    if body_items.is_empty() {
+        body_items.push(text("—").size(12).color(theme::TEXT_DIM).into());
+    }
+
+    let header = row![section_label("Storage")]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+    let body = column(body_items).spacing(4).width(Length::Fill);
+    panel(header.into(), Some(body.into()), true, false)
+}
+
+fn health_battery_panel(health: &crate::model::HealthSnapshot) -> Element<'static, Message> {
+    let mut body_items: Vec<Element<'static, Message>> = Vec::new();
+
+    match &health.batteries {
+        Reading::Value(bats) if !bats.is_empty() => {
+            for b in bats {
+                body_items.push(battery_row(b));
+            }
+        }
+        Reading::Value(_) => {
+            body_items.push(text("No batteries").size(12).color(theme::TEXT_DIM).into());
+        }
+        Reading::Unavailable { .. } => {
+            body_items.push(text("—").size(12).color(theme::TEXT_DIM).into());
+        }
+    }
+
+    let header = row![section_label("Battery")]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+    // Slightly looser than Storage so pack + peripherals breathe;
+    // extra top padding separates the "Battery" title from the first row.
+    let body = column(body_items)
+        .spacing(8)
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            top: 6.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+    panel(header.into(), Some(body.into()), true, false)
+}
+
+fn mount_row(m: &crate::model::MountRow) -> Element<'static, Message> {
+    let frac = (m.use_percent / 100.0).clamp(0.0, 1.0);
+    let bar = fill_bar(frac, theme::ACCENT_MEM);
+    let stats = format!(
+        "{} · {} avail",
+        bytes_to_human(m.used_bytes),
+        bytes_to_human(m.available_bytes)
+    );
+    row![
+        text(m.mountpoint.clone())
+            .size(12)
+            .color(theme::TEXT)
+            .width(Length::Fixed(100.0)),
+        bar,
+        Space::new().width(8),
+        text(stats).size(12).color(theme::TEXT_DIM),
+    ]
+    .spacing(8)
     .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
+fn drive_row(d: &crate::model::DriveRow) -> Element<'static, Message> {
+    let size = match &d.size_bytes {
+        Reading::Value(b) => bytes_to_human(*b),
+        Reading::Unavailable { .. } => "—".into(),
+    };
+    let mut parts = vec![d.model.clone(), d.kind.label().to_string(), size];
+    if let Reading::Value(t) = &d.temp_celsius {
+        parts.push(format!("{t:.0}°C"));
+    }
+    if let Reading::Value(w) = &d.wear_percent_used {
+        parts.push(format!("wear {w}%"));
+    }
+    // Interesting SMART only.
+    if let Reading::Value(c) = &d.critical_warning
+        && *c != 0
+    {
+        parts.push(format!("warn 0x{c:02x}"));
+    }
+    if let Reading::Value(e) = &d.media_errors
+        && *e > 0
+    {
+        parts.push(format!("media err {e}"));
+    }
+    let line = parts.join(" · ");
+    text(line).size(12).color(theme::TEXT).into()
+}
+
+fn battery_row(b: &crate::model::BatteryRow) -> Element<'static, Message> {
+    let charge = match &b.charge_percent {
+        Reading::Value(p) => format!("{p:.0}%"),
+        Reading::Unavailable { .. } => match &b.capacity_level {
+            Reading::Value(l) => l.clone(),
+            Reading::Unavailable { .. } => "—".into(),
+        },
+    };
+
+    let mut trailing = String::new();
+    if b.kind == crate::model::BatteryKind::System {
+        if let Reading::Value(h) = &b.health_percent {
+            trailing.push_str(&format!("health {h:.0}%"));
+        }
+        if let Reading::Value(c) = &b.cycle_count {
+            if !trailing.is_empty() {
+                trailing.push_str(" · ");
+            }
+            trailing.push_str(&format!("{c} cycles"));
+        }
+    }
+
+    let label = if b.kind == crate::model::BatteryKind::System {
+        format!("{} · {}", b.id, b.label)
+    } else {
+        b.label.clone()
+    };
+
+    row![
+        text(label)
+            .size(12)
+            .color(theme::TEXT)
+            .width(Length::FillPortion(3)),
+        text(charge)
+            .size(12)
+            .color(theme::TEXT)
+            .width(Length::FillPortion(1)),
+        text(trailing)
+            .size(12)
+            .color(theme::TEXT_DIM)
+            .width(Length::FillPortion(3)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
+/// Simple horizontal fill bar (used fraction 0..1).
+fn fill_bar(fraction: f32, color: Color) -> Element<'static, Message> {
+    let filled = ((fraction.clamp(0.0, 1.0) * 100.0).round() as u16).min(100);
+    let empty = 100u16.saturating_sub(filled);
+    let filled_w = filled.max(if fraction > 0.0 { 1 } else { 0 });
+    let empty_w = if empty == 0 && filled_w < 100 {
+        0
+    } else {
+        empty.max(if fraction < 1.0 { 1 } else { 0 })
+    };
+
+    let fill = container(Space::new().width(Length::Fill).height(Length::Fill))
+        .width(Length::FillPortion(filled_w.max(1)))
+        .height(Length::Fixed(8.0))
+        .style(move |_t| container::Style {
+            background: Some(iced::Background::Color(color)),
+            border: iced::Border {
+                radius: 2.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+    let rest = container(Space::new().width(Length::Fill).height(Length::Fill))
+        .width(Length::FillPortion(empty_w.max(1)))
+        .height(Length::Fixed(8.0))
+        .style(|_t| container::Style {
+            background: Some(iced::Background::Color(theme::with_alpha(
+                theme::BORDER,
+                0.6,
+            ))),
+            border: iced::Border {
+                radius: 2.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+    // Always show both tracks so layout is stable near 0% / 100%.
+    let parts: Vec<Element<'static, Message>> = if filled == 0 {
+        vec![rest.into()]
+    } else if empty == 0 {
+        vec![fill.into()]
+    } else {
+        vec![fill.into(), rest.into()]
+    };
+
+    container(
+        row(parts)
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fixed(8.0)),
+    )
+    .width(Length::Fixed(140.0))
     .into()
 }
 
@@ -573,9 +806,9 @@ fn processes_body<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Me
         let label = text("End Process").size(12);
         let mut btn = button(label).padding([6, 12]);
         // Only arm when selection is currently visible (re-checked each frame).
-        let armed = app.selected_process.is_some_and(|sel| {
-            visible.rows.iter().any(|r| r.id == sel)
-        });
+        let armed = app
+            .selected_process
+            .is_some_and(|sel| visible.rows.iter().any(|r| r.id == sel));
         if armed {
             btn = btn
                 .style(iced::widget::button::danger)
@@ -584,22 +817,20 @@ fn processes_body<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Me
         btn
     };
 
-    let status = text(
-        app.process_status.clone().unwrap_or_else(|| {
-            if let Some(sel) = app.selected_process {
-                if let Some(r) = visible.rows.iter().find(|r| r.id == sel) {
-                    format!(
-                        "selected {} ({}) — End Process sends SIGTERM",
-                        r.name, r.id.pid
-                    )
-                } else {
-                    "select a process".into()
-                }
+    let status = text(app.process_status.clone().unwrap_or_else(|| {
+        if let Some(sel) = app.selected_process {
+            if let Some(r) = visible.rows.iter().find(|r| r.id == sel) {
+                format!(
+                    "selected {} ({}) — End Process sends SIGTERM",
+                    r.name, r.id.pid
+                )
             } else {
                 "select a process".into()
             }
-        }),
-    )
+        } else {
+            "select a process".into()
+        }
+    }))
     .size(11)
     .color(theme::TEXT_DIM);
 
@@ -695,11 +926,7 @@ fn process_row(row: &ProcessRow, selected: bool) -> Element<'static, Message> {
         n
     };
 
-    let fg = if selected {
-        Color::WHITE
-    } else {
-        theme::TEXT
-    };
+    let fg = if selected { Color::WHITE } else { theme::TEXT };
     let dim = if selected {
         Color::WHITE
     } else {
@@ -707,7 +934,10 @@ fn process_row(row: &ProcessRow, selected: bool) -> Element<'static, Message> {
     };
 
     let cells = row![
-        text(name).size(12).color(fg).width(Length::FillPortion(COL_NAME)),
+        text(name)
+            .size(12)
+            .color(fg)
+            .width(Length::FillPortion(COL_NAME)),
         text(cpu)
             .size(12)
             .color(fg)
