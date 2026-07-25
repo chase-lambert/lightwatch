@@ -511,6 +511,8 @@ pub struct Snapshot {
     pub memory: MemorySnapshot,
     pub gpus: Vec<GpuSnapshot>,
     pub self_metrics: SelfSnapshot,
+    /// Userspace processes for the Processes tab (latest-only; no rings).
+    pub processes: Vec<crate::model::process::ProcessRow>,
 }
 
 // ---------------------------------------------------------------------------

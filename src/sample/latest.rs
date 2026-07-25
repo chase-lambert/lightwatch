@@ -102,6 +102,7 @@ mod tests {
                     sampler_overruns: 0,
                     ticks_skipped: 0,
                 },
+                processes: vec![],
             },
             history: History::new(&HistoryConfig::default_config(), &[], &[]),
         })

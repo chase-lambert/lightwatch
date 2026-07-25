@@ -1,5 +1,6 @@
 use super::latest::{Latest, Published};
 use crate::collect::gpu::{self, GpuDevice, amd, nvidia};
+use crate::collect::proc::ProcessCollector;
 use crate::collect::{cpu::CpuCollector, mem::MemCollector, self_metrics::SelfCollector};
 use crate::model::*;
 use core::time::Duration;
@@ -50,6 +51,7 @@ pub struct Sampler {
     cpu_collector: CpuCollector,
     mem_collector: MemCollector,
     self_collector: SelfCollector,
+    process_collector: ProcessCollector,
     history: History,
     gpu_devices: Vec<GpuDevice>,
     seq: u64,
@@ -80,6 +82,7 @@ impl Sampler {
             cpu_collector: CpuCollector::new("/proc", "/sys"),
             mem_collector: MemCollector::new("/proc"),
             self_collector: SelfCollector::new("/proc"),
+            process_collector: ProcessCollector::new("/proc"),
             config,
             latest,
             notify,
@@ -168,6 +171,7 @@ impl Sampler {
                     // Clear baselines before sampling
                     self.cpu_collector.clear_baseline();
                     self.self_collector.clear_baseline();
+                    self.process_collector.clear_baseline();
                 }
             }
 
@@ -210,6 +214,8 @@ impl Sampler {
 
             self.seq += 1;
             let t_boot_ns = crate::clock_boottime_ns();
+            // Process CPU% wall time uses the snapshot boottime stamp.
+            let processes = self.process_collector.sample(t_boot_ns);
             let sample_dur = sample_start.elapsed();
             self.prev_t_boot_ns = Some(t_boot_ns);
 
@@ -223,6 +229,7 @@ impl Sampler {
                 memory: mem_snap,
                 gpus: gpu_snaps,
                 self_metrics: self_snap,
+                processes,
             };
 
             // Push to history rings
@@ -547,11 +554,13 @@ pub fn sample_once(config: &HistoryConfig) -> Result<Snapshot, String> {
     let mut cpu = CpuCollector::new("/proc", "/sys");
     let mem = MemCollector::new("/proc");
     let mut self_coll = SelfCollector::new("/proc");
+    let mut process_coll = ProcessCollector::new("/proc");
     let gpu_devices = gpu::discover("/sys");
 
     // Take baseline, wait, take second sample for deltas
     let _baseline = cpu.sample(); // prime the baseline
     let _baseline_self = self_coll.sample(0, 0, 0);
+    let _baseline_proc = process_coll.sample(crate::clock_boottime_ns());
 
     std::thread::sleep(config.interval);
 
@@ -590,9 +599,12 @@ pub fn sample_once(config: &HistoryConfig) -> Result<Snapshot, String> {
         gpu_snaps.push(snap);
     }
 
+    let t_boot_ns = crate::clock_boottime_ns();
+    let processes = process_coll.sample(t_boot_ns);
+
     Ok(Snapshot {
         seq: 1,
-        t_boot_ns: crate::clock_boottime_ns(),
+        t_boot_ns,
         sample_duration_us: 0,
         sampler_overruns: 0,
         ticks_skipped: 0,
@@ -600,6 +612,7 @@ pub fn sample_once(config: &HistoryConfig) -> Result<Snapshot, String> {
         memory: mem_snap,
         gpus: gpu_snaps,
         self_metrics: self_snap,
+        processes,
     })
 }
 

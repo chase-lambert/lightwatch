@@ -2,13 +2,16 @@ use super::graph::{MultiChart, SeriesData};
 use super::graph_geom::DrawWindow;
 use super::prefs::{self, SectionId, SectionVisibility};
 use super::theme;
+use crate::collect::proc::{self as proc_collect, KillOutcome};
 use crate::model::*;
 use crate::sample::latest::{Latest, Published};
 use crate::sample::worker::Sampler;
 use iced::widget::{
-    Canvas, Space, button, column, container, responsive, row, scrollable, text, tooltip,
+    Canvas, Space, button, column, container, mouse_area, responsive, row, scrollable, text,
+    text_input, tooltip,
 };
 use iced::{Alignment, Color, Element, Length, Size, Subscription, Theme};
+use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 
 // ---------------------------------------------------------------------------
@@ -95,6 +98,14 @@ pub fn use_flex(available_h: f32, plan: &LayoutPlan) -> bool {
 // App state
 // ---------------------------------------------------------------------------
 
+/// Top-level dashboard tab (GSM-style shell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppTab {
+    Resources,
+    Processes,
+    Health,
+}
+
 /// UI state held by the application.
 pub struct Lightwatch {
     latest: Arc<Latest>,
@@ -106,6 +117,15 @@ pub struct Lightwatch {
     selected_preset: HistoryPreset,
     presets: Vec<HistoryPreset>,
     visibility: SectionVisibility,
+    active_tab: AppTab,
+    /// Process search query (UI-only).
+    process_query: String,
+    process_sort: ProcessSortKey,
+    /// When true, larger values first for the active numeric column.
+    process_sort_desc: bool,
+    selected_process: Option<ProcessId>,
+    /// Soft status under End Process (signal sent / denied / gone).
+    process_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +167,11 @@ pub enum Message {
     SampleArrived,
     SelectPreset(HistoryPreset),
     ToggleSection(SectionId),
+    SelectTab(AppTab),
+    ProcessQueryChanged(String),
+    SortProcesses(ProcessSortKey),
+    SelectProcess(ProcessId),
+    EndProcess,
 }
 
 /// Boot function for the iced application.
@@ -182,6 +207,12 @@ pub fn boot(config: HistoryConfig) -> (Lightwatch, iced::Task<Message>) {
         selected_preset: initial_preset,
         presets: HistoryPreset::all(),
         visibility: prefs::load_ui_prefs(),
+        active_tab: AppTab::Resources,
+        process_query: String::new(),
+        process_sort: ProcessSortKey::Memory,
+        process_sort_desc: true,
+        selected_process: None,
+        process_status: None,
     };
     (app, iced::Task::none())
 }
@@ -198,6 +229,19 @@ pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
             while app.notify_rx.try_recv().is_ok() {}
             if let Some((g, pubd)) = app.latest.pull_if_newer(app.last_seen_gen) {
                 app.last_seen_gen = g;
+                // Clear selection if it is no longer in the *visible* table
+                // (left the set, filtered out, or fell outside the display cap).
+                if let Some(sel) = app.selected_process
+                    && !selection_is_visible(
+                        &pubd.snapshot.processes,
+                        &app.process_query,
+                        app.process_sort,
+                        app.process_sort_desc,
+                        sel,
+                    )
+                {
+                    app.selected_process = None;
+                }
                 app.published = Some(pubd);
             }
             iced::Task::none()
@@ -219,6 +263,83 @@ pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
             prefs::save_ui_prefs(&app.visibility);
             iced::Task::none()
         }
+        Message::SelectTab(tab) => {
+            app.active_tab = tab;
+            iced::Task::none()
+        }
+        Message::ProcessQueryChanged(q) => {
+            app.process_query = q;
+            clear_selection_if_not_visible(app);
+            iced::Task::none()
+        }
+        Message::SortProcesses(key) => {
+            if app.process_sort == key {
+                app.process_sort_desc = !app.process_sort_desc;
+            } else {
+                app.process_sort = key;
+                // Deliberate: numeric columns start descending (hog-first);
+                // Name/PID start ascending (dictionary / id order).
+                app.process_sort_desc = !matches!(key, ProcessSortKey::Name | ProcessSortKey::Pid);
+            }
+            clear_selection_if_not_visible(app);
+            iced::Task::none()
+        }
+        Message::SelectProcess(id) => {
+            app.selected_process = Some(id);
+            app.process_status = None;
+            iced::Task::none()
+        }
+        Message::EndProcess => {
+            if let Some(id) = app.selected_process {
+                let outcome = proc_collect::end_process(Path::new("/proc"), id);
+                app.process_status = Some(kill_status_text(&outcome));
+                // Clear selection when gone/mismatched, or after a successful
+                // root redirect (the helper may linger briefly as a zombie view).
+                if matches!(
+                    outcome,
+                    KillOutcome::Gone
+                        | KillOutcome::IdentityMismatch
+                        | KillOutcome::SignalSentToRoot { .. }
+                ) {
+                    app.selected_process = None;
+                }
+            }
+            iced::Task::none()
+        }
+    }
+}
+
+fn kill_status_text(outcome: &KillOutcome) -> String {
+    match outcome {
+        KillOutcome::SignalSent => "signal sent (SIGTERM)".into(),
+        KillOutcome::SignalSentToRoot { root_pid } => {
+            format!("signal sent (SIGTERM) to app root pid {root_pid}")
+        }
+        KillOutcome::Gone => "process gone".into(),
+        KillOutcome::IdentityMismatch => "process identity changed — not signalled".into(),
+        KillOutcome::PermissionDenied => "permission denied".into(),
+        KillOutcome::Failed(s) => format!("failed: {s}"),
+    }
+}
+
+/// Drop selection when it is not in the current visible slice (auth boundary
+/// for End Process is the highlighted visible row).
+fn clear_selection_if_not_visible(app: &mut Lightwatch) {
+    let Some(sel) = app.selected_process else {
+        return;
+    };
+    let Some(pubd) = app.published.as_ref() else {
+        app.selected_process = None;
+        return;
+    };
+    if !selection_is_visible(
+        &pubd.snapshot.processes,
+        &app.process_query,
+        app.process_sort,
+        app.process_sort_desc,
+        sel,
+    ) {
+        app.selected_process = None;
     }
 }
 
@@ -237,7 +358,129 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
     };
 
     let snap = &published.snapshot;
-    let hist = &published.history;
+    // One chrome row: tabs left, tab-specific control (presets / search) right.
+    let chrome = tab_chrome(app, snap);
+
+    let body: Element<'_, Message> = match app.active_tab {
+        AppTab::Resources => resources_body(app, snap, &published.history),
+        AppTab::Processes => processes_body(app, snap),
+        AppTab::Health => health_body(),
+    };
+
+    // Extra air between the tab chrome and the first panel (CPU / table / health).
+    column![chrome, body]
+        .spacing(10)
+        .padding(iced::Padding {
+            top: 8.0,
+            right: 8.0,
+            bottom: 6.0,
+            left: 8.0,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// Tabs on the left; trailing chrome (history presets or process search) on the right.
+fn tab_chrome<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Message> {
+    let tabs = tab_buttons(app.active_tab);
+    let trailing: Element<'a, Message> = match app.active_tab {
+        AppTab::Resources => history_presets(app),
+        AppTab::Processes => {
+            let match_count = visible_processes(
+                &snap.processes,
+                &app.process_query,
+                app.process_sort,
+                app.process_sort_desc,
+            )
+            .match_count;
+            process_search_trailing(app, match_count)
+        }
+        AppTab::Health => Space::new().width(Length::Shrink).into(),
+    };
+
+    row![tabs, Space::new().width(Length::Fill), trailing]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .padding([0, 2])
+        .width(Length::Fill)
+        .into()
+}
+
+fn tab_buttons(active: AppTab) -> Element<'static, Message> {
+    let tabs = [
+        (AppTab::Resources, "Resources"),
+        (AppTab::Processes, "Processes"),
+        (AppTab::Health, "Health"),
+    ];
+    let buttons: Vec<Element<Message>> = tabs
+        .iter()
+        .map(|(tab, label)| {
+            let selected = *tab == active;
+            let label = text(*label).size(12).color(if selected {
+                Color::WHITE
+            } else {
+                theme::TEXT_DIM
+            });
+            let mut btn = button(label).padding([4, 10]);
+            if selected {
+                btn = btn.style(iced::widget::button::primary);
+            } else {
+                btn = btn.style(iced::widget::button::text);
+            }
+            btn.on_press(Message::SelectTab(*tab)).into()
+        })
+        .collect();
+    row(buttons).spacing(4).align_y(Alignment::Center).into()
+}
+
+fn history_presets(app: &Lightwatch) -> Element<'_, Message> {
+    let buttons: Vec<Element<Message>> = app
+        .presets
+        .iter()
+        .map(|p| {
+            let is_selected = *p == app.selected_preset;
+            let label = text(p.label()).size(11).color(if is_selected {
+                Color::WHITE
+            } else {
+                theme::TEXT_DIM
+            });
+            let mut btn = button(label).padding([4, 8]);
+            if is_selected {
+                btn = btn.style(iced::widget::button::primary);
+            }
+            btn.on_press(Message::SelectPreset(*p)).into()
+        })
+        .collect();
+    row(buttons).spacing(4).align_y(Alignment::Center).into()
+}
+
+fn process_search_trailing(app: &Lightwatch, match_count: usize) -> Element<'_, Message> {
+    let count_label = if app.process_query.trim().is_empty() {
+        format!("{match_count} processes")
+    } else {
+        format!("{match_count} match(es)")
+    };
+    let search = text_input("Search name or pid…", &app.process_query)
+        .on_input(Message::ProcessQueryChanged)
+        .padding(5)
+        .size(12)
+        .width(Length::Fixed(220.0));
+
+    row![
+        text(count_label).size(11).color(theme::TEXT_DIM),
+        search,
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn resources_body<'a>(
+    app: &'a Lightwatch,
+    snap: &'a Snapshot,
+    hist: &'a History,
+) -> Element<'a, Message> {
     let window_secs = app.config.window.as_secs_f64();
     // Two-interval diagnostic look-ahead: chart "now" lags wall clock by two
     // sample intervals so the next two real samples sit off-screen right and
@@ -245,32 +488,6 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
     let interval_ns = app.config.interval.as_nanos() as u64;
     let delay_ns = interval_ns.saturating_mul(2);
     let window_end_ns = crate::clock_boottime_ns().saturating_sub(delay_ns);
-
-    let presets = {
-        let buttons: Vec<Element<Message>> = app
-            .presets
-            .iter()
-            .map(|p| {
-                let is_selected = *p == app.selected_preset;
-                let label = text(p.label()).size(11).color(if is_selected {
-                    Color::WHITE
-                } else {
-                    theme::TEXT_DIM
-                });
-                let mut btn = button(label);
-                if is_selected {
-                    btn = btn.style(iced::widget::button::primary);
-                }
-                btn.on_press(Message::SelectPreset(*p)).into()
-            })
-            .collect();
-        row(buttons).spacing(4)
-    };
-
-    let chrome = row![presets, Space::new().width(Length::Fill)]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .padding([0, 2]);
 
     let gpu_expanded = snap
         .gpus
@@ -287,7 +504,7 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
     };
 
     let vis = app.visibility.clone();
-    let sections = responsive(move |size: Size| {
+    responsive(move |size: Size| {
         let flex = use_flex(size.height, &layout_plan);
         build_sections(
             snap,
@@ -300,14 +517,244 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
         )
     })
     .width(Length::Fill)
-    .height(Length::Fill);
+    .height(Length::Fill)
+    .into()
+}
 
-    column![self_strip(snap), chrome, sections]
+fn health_body() -> Element<'static, Message> {
+    container(
+        column![
+            text("System health").size(16).color(theme::TEXT),
+            text("Reserved for a later pass.")
+                .size(12)
+                .color(theme::TEXT_DIM),
+        ]
+        .spacing(8)
+        .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+// Column flex portions for the process table (sum = 100).
+const COL_NAME: u16 = 28;
+const COL_CPU: u16 = 12;
+const COL_MEM: u16 = 14;
+const COL_DREAD: u16 = 16;
+const COL_DWRITE: u16 = 16;
+const COL_PID: u16 = 14;
+
+fn processes_body<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Message> {
+    let visible = visible_processes(
+        &snap.processes,
+        &app.process_query,
+        app.process_sort,
+        app.process_sort_desc,
+    );
+
+    // Search lives in the shared tab chrome row; body starts at the table.
+    let headers = process_header_row(app.process_sort, app.process_sort_desc);
+
+    let selected = app.selected_process;
+    let body_rows: Vec<Element<Message>> = visible
+        .rows
+        .iter()
+        .map(|r| process_row(r, selected == Some(r.id)))
+        .collect();
+
+    let list = scrollable(column(body_rows).spacing(1).width(Length::Fill))
+        .height(Length::Fill)
+        .width(Length::Fill);
+
+    let end_btn = {
+        let label = text("End Process").size(12);
+        let mut btn = button(label).padding([6, 12]);
+        // Only arm when selection is currently visible (re-checked each frame).
+        let armed = app.selected_process.is_some_and(|sel| {
+            visible.rows.iter().any(|r| r.id == sel)
+        });
+        if armed {
+            btn = btn
+                .style(iced::widget::button::danger)
+                .on_press(Message::EndProcess);
+        }
+        btn
+    };
+
+    let status = text(
+        app.process_status.clone().unwrap_or_else(|| {
+            if let Some(sel) = app.selected_process {
+                if let Some(r) = visible.rows.iter().find(|r| r.id == sel) {
+                    format!(
+                        "selected {} ({}) — End Process sends SIGTERM",
+                        r.name, r.id.pid
+                    )
+                } else {
+                    "select a process".into()
+                }
+            } else {
+                "select a process".into()
+            }
+        }),
+    )
+    .size(11)
+    .color(theme::TEXT_DIM);
+
+    let footer = row![end_btn, Space::new().width(12), status]
         .spacing(4)
-        .padding(6)
+        .align_y(Alignment::Center)
+        .padding([4, 2]);
+
+    column![headers, list, footer]
+        .spacing(4)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+fn sort_marker(active: bool, desc: bool) -> &'static str {
+    if !active {
+        ""
+    } else if desc {
+        " ▼"
+    } else {
+        " ▲"
+    }
+}
+
+fn process_header_row(sort: ProcessSortKey, desc: bool) -> Element<'static, Message> {
+    let cell = |key: ProcessSortKey, label: &str, portion: u16| -> Element<'static, Message> {
+        let mark = sort_marker(sort == key, desc);
+        let t = text(format!("{label}{mark}"))
+            .size(11)
+            .color(if sort == key {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            });
+        button(t)
+            .style(iced::widget::button::text)
+            .padding(2)
+            .on_press(Message::SortProcesses(key))
+            .width(Length::FillPortion(portion))
+            .into()
+    };
+
+    container(
+        row![
+            cell(ProcessSortKey::Name, "Name", COL_NAME),
+            cell(ProcessSortKey::Cpu, "% CPU", COL_CPU),
+            cell(ProcessSortKey::Memory, "Memory", COL_MEM),
+            cell(ProcessSortKey::DiskRead, "Disk read", COL_DREAD),
+            cell(ProcessSortKey::DiskWrite, "Disk write", COL_DWRITE),
+            cell(ProcessSortKey::Pid, "ID", COL_PID),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+    )
+    .padding([2, 4])
+    .style(|_t| container::Style {
+        background: Some(iced::Background::Color(theme::SURFACE)),
+        border: iced::Border {
+            color: theme::BORDER,
+            width: 1.0,
+            radius: 2.0.into(),
+        },
+        ..Default::default()
+    })
+    .width(Length::Fill)
+    .into()
+}
+
+fn process_row(row: &ProcessRow, selected: bool) -> Element<'static, Message> {
+    let cpu = match &row.cpu_percent {
+        Reading::Value(v) => format!("{v:.1}"),
+        Reading::Unavailable { .. } => "—".into(),
+    };
+    let mem = bytes_to_human(row.mem_anon_kb.saturating_mul(1024));
+    let dread = match &row.disk_read_bytes {
+        Reading::Value(v) => bytes_to_human(*v),
+        Reading::Unavailable { .. } => "—".into(),
+    };
+    let dwrite = match &row.disk_write_bytes {
+        Reading::Value(v) => bytes_to_human(*v),
+        Reading::Unavailable { .. } => "—".into(),
+    };
+
+    // Allow full binary names (e.g. gnome-system-monitor); still ellipsize
+    // pathological long names so the row layout stays stable.
+    let name = {
+        const NAME_MAX: usize = 48;
+        let mut n = row.name.clone();
+        if n.chars().count() > NAME_MAX {
+            n = n.chars().take(NAME_MAX - 1).collect::<String>() + "…";
+        }
+        n
+    };
+
+    let fg = if selected {
+        Color::WHITE
+    } else {
+        theme::TEXT
+    };
+    let dim = if selected {
+        Color::WHITE
+    } else {
+        theme::TEXT_DIM
+    };
+
+    let cells = row![
+        text(name).size(12).color(fg).width(Length::FillPortion(COL_NAME)),
+        text(cpu)
+            .size(12)
+            .color(fg)
+            .width(Length::FillPortion(COL_CPU)),
+        text(mem)
+            .size(12)
+            .color(fg)
+            .width(Length::FillPortion(COL_MEM)),
+        text(dread)
+            .size(12)
+            .color(dim)
+            .width(Length::FillPortion(COL_DREAD)),
+        text(dwrite)
+            .size(12)
+            .color(dim)
+            .width(Length::FillPortion(COL_DWRITE)),
+        text(row.id.pid.to_string())
+            .size(12)
+            .color(dim)
+            .width(Length::FillPortion(COL_PID)),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .padding([3, 4]);
+
+    let bg = if selected {
+        theme::with_alpha(theme::ACCENT_CPU, 0.35)
+    } else {
+        Color::TRANSPARENT
+    };
+
+    let id = row.id;
+    mouse_area(
+        container(cells)
+            .width(Length::Fill)
+            .style(move |_t| container::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    radius: 2.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::SelectProcess(id))
+    .into()
 }
 
 fn build_sections<'a>(
@@ -471,40 +918,6 @@ fn section_portion(expanded: bool, flex: bool) -> Length {
 // ---------------------------------------------------------------------------
 // Section builders
 // ---------------------------------------------------------------------------
-
-fn self_strip(snap: &Snapshot) -> Element<'static, Message> {
-    let selfm = &snap.self_metrics;
-    let anon = rfmt(&selfm.rss_anon_kb, |v| {
-        format!("{:.1} MiB", *v as f64 / 1024.0)
-    });
-    let rss = rfmt(&selfm.rss_kb, |v| format!("{:.1} MiB", *v as f64 / 1024.0));
-    let cpu = rfmt(&selfm.cpu_percent, |v| format!("{v:.1}%"));
-    let dur = format!("{}us", snap.sample_duration_us);
-
-    let items = row![
-        text("lightwatch")
-            .size(11)
-            .color(theme::with_alpha(theme::ACCENT_SELF, 0.7)),
-        Space::new().width(Length::Fill),
-        text(dur).size(10).color(theme::TEXT_DIM),
-        Space::new().width(8),
-        text(format!("Anon {}", anon))
-            .size(10)
-            .color(theme::with_alpha(theme::TEXT, 0.6)),
-        Space::new().width(8),
-        text(format!("RSS {}", rss))
-            .size(10)
-            .color(theme::with_alpha(theme::TEXT, 0.4)),
-        Space::new().width(12),
-        text(cpu)
-            .size(10)
-            .color(theme::with_alpha(theme::TEXT, 0.6)),
-    ]
-    .align_y(Alignment::Center)
-    .spacing(0);
-
-    container(items).padding(4).into()
-}
 
 fn cpu_section(
     snap: &Snapshot,

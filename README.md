@@ -6,7 +6,7 @@ Lightwatch's warm default settles under 30 MiB of resident private memory on my 
 
 Rust + [iced](https://iced.rs). Linux only. MIT.
 
-![lightwatch dashboard — CPU, Memory, AMD + NVIDIA GPUs with GSM-style section disclosure](docs/lightwatch-dashboard.png)
+![lightwatch Resources tab — CPU, Memory, AMD + NVIDIA GPUs with history presets on the tab chrome](docs/lightwatch-dashboard.png)
 
 ## Quick start
 
@@ -15,6 +15,9 @@ cargo build --release
 cargo run --release              # GUI
 cargo run --release -- --once    # one snapshot (waits ~1s for CPU deltas)
 cargo run --release -- --soak 30 # headless RSS/CPU soak
+
+# Install/update the binary used by a desktop/tray launcher:
+cargo install --path . --force   # → ~/.cargo/bin/lightwatch
 ```
 
 | Flag | Default | Meaning |
@@ -44,16 +47,18 @@ Separately, Lightwatch defaults iced's Tokio runtime to one worker. Set `TOKIO_W
 
 ## What it shows
 
+Tabs: **Resources** (default) · **Processes** · **Health** (placeholder).
+
 - **CPU** — overall %, temp, freq in header; **all logical CPUs** as multi-series overlay chart with stable per-core colors and legend (live % per core). Up to 256 cores supported; palette wraps at 16 colors.
 - **Memory / swap** — dual-series chart (used %, swap %) with grid; stat chips for Used, Avail, Swap, Load 1/5/15
 - **GPUs** — discovered by **PCI address**, not DRM card index  
   - AMD: sysfs (`gpu_busy_percent`, VRAM, hwmon)  
   - NVIDIA: NVML only when sysfs `runtime_status` is **`active`** (fail-closed; will not wake a suspended dGPU)
-- **Self** — private anonymous footprint (RssAnon), total RSS, self CPU%, last sample duration, overruns, skipped ticks. Private footprint answers "what does lightwatch itself own?" while total RSS explains system-monitor differences and GPU mappings.
+- **Processes** — full userspace list (default sort Memory ↓; scrollable). Columns: Name, % CPU (**share of total machine capacity**, not per-core), Memory (**RssAnon** private footprint), Disk read/write totals, ID. Electron helpers show as `slack (renderer)` etc. Click headers to sort; search by name or pid prefix. **End Process** sends SIGTERM (no dialog; identity checked via pid+starttime). Selecting a Chromium/Electron helper walks to the app root before signalling so the whole app closes instead of blanking one view.
 - **Layout** — expanded chart panels share the window height equally; scroll only when the window is too short for useful minimums.
 - **Section disclosure** — GSM-style **▾ / ▸** next to each section title collapses/expands the body (header stays with live summary). State is UI-only (sampling continues) and persists in `$XDG_CONFIG_HOME/lightwatch/ui.conf` (or `~/.config/lightwatch/ui.conf`).
 
-**Not in MVP:** process table/kill, network, disk I/O, alerts, plugins, remote, daemons, root-only metrics.
+**Not in MVP:** network, disk I/O dashboards, alerts, plugins, remote, daemons, root-only metrics, process tree, SIGKILL escalate.
 
 ## Architecture (agents + humans)
 
@@ -76,18 +81,20 @@ UI (iced)  ←── notify + pull latest Arc ──  Sampler thread
 | NVIDIA | Power gate before **any** NVML init/handle/query |
 | Memory | `used = MemTotal.saturating_sub(MemAvailable)` |
 | CPU % | `/proc/stat` deltas; no guest double-count; counter decrease → rebaseline |
+| Process CPU % | utime+stime deltas ÷ wall ÷ online logical CPUs × 100 (share of **total** capacity) |
+| Process memory | `RssAnon` (private footprint); full names from exe/argv0 basename, not 15-char `comm` |
 
 ```
 src/
-  model/     Snapshot, Reading, HistoryConfig, Ring, SamplePoint
-  parse/     /proc/stat, meminfo, loadavg, self/stat, self/status  (pure, tested)
-  collect/   cpu, mem, self, gpu/{amd,nvidia}
-  sample/    worker (deadline + rings), latest (single slot)
-  ui/        iced view, prefs, sparklines
+  model/     Snapshot, Reading, History, ProcessRow, process name helpers
+  parse/     /proc/stat, meminfo, loadavg, self/*, pid/{stat,io}  (pure, tested)
+  collect/   cpu, mem, self, proc, gpu/{amd,nvidia}
+  sample/    worker (deadline + rings + process scan), latest (single slot)
+  ui/        iced tabs (Resources / Processes / Health), prefs, sparklines
   diag.rs    --once / --soak
 ```
 
-Layout is TEA-shaped (immutable model, messages, subscription). Collectors stay UI-agnostic. Section visibility is pure UI state over the same live history.
+Layout is TEA-shaped (immutable model, messages, subscription). Collectors stay UI-agnostic. Section visibility is pure UI state over the same live history. Process rows are latest-only (no history rings).
 
 ## Performance
 
@@ -121,9 +128,10 @@ Release-mode geometry stress tests cover 256 series × 7,200 points. Ordinary ga
 
 ## Why numbers differ from GNOME System Monitor
 
-- **Process memory** — GNOME's process-details `Memory` is resident minus shared in these captures. It excludes swapped-out private pages; use `RssAnon + VmSwap` when looking for growth over time.
+- **Process memory** — Lightwatch’s process table uses **`RssAnon`** (private anonymous). GNOME’s process-details `Memory` has been observed as resident minus shared in paired captures (closer to private total, not pure Anon). Swapped private pages are outside both UIs unless you track `RssAnon + VmSwap` over time.
+- **Process CPU %** — Lightwatch shows share of **total** machine capacity (same spirit as GNOME’s process list). Per-core charts on Resources remain 0–100% of that core.
 - **Memory “used”** — we use `MemTotal − MemAvailable`. GNOME often reports a different used/cache split; totals and “pressure” semantics won’t match line-for-line.
-- **CPU** — overall % is from the aggregate `cpu` line; GNOME’s multi-core view weights cores visually. Sampling phase and window also differ.
+- **Overall CPU** — aggregate `%` is from the `cpu` line; GNOME’s multi-core view weights cores visually. Sampling phase and window also differ.
 - **VRAM / GPU** — different sources (sysfs vs NVML vs GNOME’s path) and units.
 
 Treat lightwatch as its own instrument, calibrated for leave-it-open cost, not pixel-identical to GNOME.
