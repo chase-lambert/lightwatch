@@ -6,7 +6,7 @@ Lightwatch's warm default settles under 30 MiB of resident private memory on my 
 
 Rust + [iced](https://iced.rs). Linux only. MIT.
 
-![lightwatch Resources tab — CPU, Memory, AMD + NVIDIA GPUs with history presets on the tab chrome](docs/lightwatch-dashboard.png)
+![lightwatch Resources tab — CPU, Memory, AMD + NVIDIA GPUs with history presets on the tab chrome](lightwatch-dashboard.png)
 
 ## Quick start
 
