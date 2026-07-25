@@ -2,7 +2,7 @@
 
 A Linux system monitor built for leaving open. I like to keep my system monitor open continuously but the one that came with my distro had an occasional memory leak so I figured this was a good excuse to learn [Iced](https://iced.rs).
 
-Lightwatch's warm default settles under 30 MiB of resident private memory on my machine, versus roughly 80–100 MiB—and often more—for GNOME System Monitor.
+Lightwatch's warm default settles under 30 MiB of resident private memory on my machine, versus roughly 80–100 MiB for GNOME System Monitor.
 
 Rust + [iced](https://iced.rs). Linux only. MIT.
 
@@ -33,34 +33,28 @@ Needs a recent stable Rust. GUI wants Wayland or X11. NVIDIA metrics need `libnv
 
 ## GPU power posture (iGPU default)
 
-Lightwatch keeps its iced/wgpu compositor on the integrated AMD GPU by default. When `WGPU_POWER_PREF`, `VK_ICD_FILENAMES`, and `WGPU_BACKEND` are all absent and the Radeon ICD exists, startup sets `low`, the Radeon ICD path, and `vulkan` as one bundle. This avoids loading the unused GL renderer path. If the Radeon ICD is missing, only the soft `low` preference is set.
-
-Setting **any one** of those three variables disables the whole automatic bundle; Lightwatch never mixes its defaults with user GPU configuration. To recover through GL, explicitly own the backend and power preference while clearing a stale ICD filter:
+By default lightwatch pins the iced/wgpu compositor to the integrated AMD GPU: when `WGPU_POWER_PREF`, `VK_ICD_FILENAMES`, and `WGPU_BACKEND` are all unset and the Radeon ICD exists, startup sets `low` + Radeon ICD + `vulkan` as one bundle (avoids the unused GL path). If the ICD is missing, only the soft `low` preference is set. Setting **any** of those three vars disables the whole automatic bundle.
 
 ```bash
+# Recover through GL while clearing a stale ICD filter:
 env -u VK_ICD_FILENAMES WGPU_BACKEND=gl WGPU_POWER_PREF=low cargo run --release
 ```
 
-That recovery path may enumerate or wake a discrete GPU. Renderer DRM descriptors and NVIDIA NVML telemetry descriptors are separate: `/dev/nvidia*` may be open when an already-active dGPU is sampled without meaning the UI renders there. NVML is gated by sysfs `runtime_status`; Lightwatch never writes GPU power controls.
-
-Separately, Lightwatch defaults iced's Tokio runtime to one worker. Set `TOKIO_WORKER_THREADS` before launch to choose another size.
+NVML telemetry is orthogonal and fail-closed on sysfs `runtime_status` (never wakes a suspended dGPU). Tokio defaults to one worker; override with `TOKIO_WORKER_THREADS`.
 
 ## What it shows
 
 Tabs: **Resources** (default) · **Processes** · **Health** (placeholder).
 
-- **CPU** — overall %, temp, freq in header; **all logical CPUs** as multi-series overlay chart with stable per-core colors and legend (live % per core). Up to 256 cores supported; palette wraps at 16 colors.
-- **Memory / swap** — dual-series chart (used %, swap %) with grid; stat chips for Used, Avail, Swap, Load 1/5/15
-- **GPUs** — discovered by **PCI address**, not DRM card index  
-  - AMD: sysfs (`gpu_busy_percent`, VRAM, hwmon)  
-  - NVIDIA: NVML only when sysfs `runtime_status` is **`active`** (fail-closed; will not wake a suspended dGPU)
-- **Processes** — full userspace list (default sort Memory ↓; scrollable). Columns: Name, % CPU (**share of total machine capacity**, not per-core), Memory (**RssAnon** private footprint), Disk read/write totals, ID. Electron helpers show as `slack (renderer)` etc. Click headers to sort; search by name or pid prefix. **End Process** sends SIGTERM (no dialog; identity checked via pid+starttime). Selecting a Chromium/Electron helper walks to the app root before signalling so the whole app closes instead of blanking one view.
-- **Layout** — expanded chart panels share the window height equally; scroll only when the window is too short for useful minimums.
-- **Section disclosure** — GSM-style **▾ / ▸** next to each section title collapses/expands the body (header stays with live summary). State is UI-only (sampling continues) and persists in `$XDG_CONFIG_HOME/lightwatch/ui.conf` (or `~/.config/lightwatch/ui.conf`).
+- **CPU** — overall %, temp, freq; multi-series per-core overlay (up to 256 cores; 16-color palette wraps)
+- **Memory / swap** — used/swap charts; Used, Avail, Swap, Load 1/5/15 chips (`used = MemTotal − MemAvailable`)
+- **GPUs** — by PCI BDF; AMD via sysfs; NVIDIA via NVML only when `runtime_status` is **active**
+- **Processes** — full userspace list (sort Memory ↓ by default). Name (exe basename + Electron `(type)`), % CPU as share of **total** machine capacity, Memory as **RssAnon**, disk read/write totals, ID. Search by name or pid prefix. **End Process** = SIGTERM after `pid+starttime` check; Chromium helpers walk to the app root first
+- **Layout** — expanded Resource panels share height equally; GSM-style **▾ / ▸** disclosure; prefs in `$XDG_CONFIG_HOME/lightwatch/ui.conf` (or `~/.config/lightwatch/ui.conf`)
 
-**Not in MVP:** network, disk I/O dashboards, alerts, plugins, remote, daemons, root-only metrics, process tree, SIGKILL escalate.
+**Not in MVP:** network, disk I/O dashboards, alerts, plugins, remote, daemons, process tree, SIGKILL escalate.
 
-## Architecture (agents + humans)
+## Architecture
 
 ```
 UI (iced)  ←── notify + pull latest Arc ──  Sampler thread
@@ -71,70 +65,49 @@ UI (iced)  ←── notify + pull latest Arc ──  Sampler thread
 
 | Idea | Rule |
 |------|------|
-| Snapshots | Immutable; built each tick |
-| History | Fixed-capacity rings; `capacity = floor(window/interval) + 6` ≤ **7206** points/series. The guard supports three off-left and two off-right spline neighbors plus inclusive boundary accounting. |
-| Charts | Two-interval diagnostic look-ahead for every chart. Dense CPU history uses absolute time buckets plus raw edge bands; the outer two logical pixels remain stable through arrivals and evictions. Gaps remain discontinuities. |
-| Handoff | Single-slot latest value; **never** a queue of snapshots |
-| Time | `SamplePoint { t_boot_ns, value: Option<f32> }` via `CLOCK_BOOTTIME` (suspend-aware gaps) |
-| Scheduler | Deadline ticks; late → skip, no catch-up burst |
-| GPU id | Full PCI BDF `domain:bus:slot.function` |
-| NVIDIA | Power gate before **any** NVML init/handle/query |
-| Memory | `used = MemTotal.saturating_sub(MemAvailable)` |
-| CPU % | `/proc/stat` deltas; no guest double-count; counter decrease → rebaseline |
-| Process CPU % | utime+stime deltas ÷ wall ÷ online logical CPUs × 100 (share of **total** capacity) |
-| Process memory | `RssAnon` (private footprint); full names from exe/argv0 basename, not 15-char `comm` |
+| Snapshots | Immutable each tick; process rows latest-only (no rings) |
+| History | Fixed rings; `capacity = floor(window/interval) + 6` ≤ **7206** |
+| Charts | Two-interval look-ahead; pixel-stable edges; gaps stay gaps |
+| Handoff | Single-slot latest; never a queue |
+| Time | `CLOCK_BOOTTIME` sample stamps |
+| Scheduler | Deadline ticks; late → skip |
+| Process CPU | utime+stime ÷ wall ÷ online CPUs × 100 |
+| Process mem | `RssAnon`; names from exe/argv0 basename |
 
 ```
 src/
-  model/     Snapshot, Reading, History, ProcessRow, process name helpers
-  parse/     /proc/stat, meminfo, loadavg, self/*, pid/{stat,io}  (pure, tested)
+  model/     Snapshot, History, ProcessRow, name helpers
+  parse/     /proc parsers (pure, tested)
   collect/   cpu, mem, self, proc, gpu/{amd,nvidia}
-  sample/    worker (deadline + rings + process scan), latest (single slot)
-  ui/        iced tabs (Resources / Processes / Health), prefs, sparklines
+  sample/    worker + latest
+  ui/        tabs, prefs, sparklines
   diag.rs    --once / --soak
 ```
 
-Layout is TEA-shaped (immutable model, messages, subscription). Collectors stay UI-agnostic. Section visibility is pure UI state over the same live history. Process rows are latest-only (no history rings).
+TEA UI; collectors stay UI-agnostic.
 
 ## Performance
 
-The design keeps work and storage bounded: one sampler thread, one Tokio worker by default, a single-slot snapshot handoff, fixed-capacity history, no steady-state subprocesses, and a 100 ms display wake independent of the 1 Hz sampler.
+Bounded by design: one sampler thread, one Tokio worker by default, single-slot handoff, fixed history, 100 ms display tick vs 1 Hz sample.
 
-Measured on Pop!_OS 24.04 COSMIC Wayland, Ryzen 7 6800HS, AMD 680M + RTX 3050 Mobile, using the optimized GUI after its 66-sample history filled. Swap is the value during this measurement window, not a promise that the kernel will never page out cold memory:
+Measured on Pop!_OS 24.04 COSMIC Wayland, **Ryzen 9 6900HS**, AMD 680M + RTX 3050 Mobile, release GUI after history warm-up:
 
 | Resident private (`RssAnon`) | Total RSS | Threads | Swap | CPU |
 |------------------------------|-----------|---------|------|-----|
 | 28.7 MiB | 88.8 MiB | 7 | 0 | 0.68% of one logical CPU |
 
-`RssAnon` is resident anonymous memory owned by the process; `RssAnon + VmSwap` is the better leak signal once the kernel starts paging out cold memory. Total RSS also includes shared/file-backed mappings, which is why system monitors can show a much larger resident number. The renderer descriptors mapped to AMD PCI `0000:04:00.0`; NVIDIA descriptors belonged to telemetry for the already-active dGPU.
+`RssAnon` is private footprint; total RSS includes shared/file maps (and GPU mappings). For leak watching under swap, use **`RssAnon + VmSwap`** — a long run held ~29.5–30.3 MiB private with zero swap; under compiler pressure resident Anon fell to 4.2 MiB while Anon+Swap stayed ~30.1 MiB. Headless `--once` / `--soak` is about 0.9 MiB Anon / 6.5 MiB RSS here.
 
-The private footprint also stayed around 29.5–30.3 MiB with zero swap during a separate 50-minute candidate run. Headless `--once` / `--soak` remains about 0.9 MiB anonymous and 6.5 MiB total RSS on this machine.
+Paired GSM process-details after that reclamation: Lightwatch “Memory” 4.2 MiB vs GSM 78.9 MiB (GSM’s column was Resident − Shared and excluded swapped pages). Treat instruments as calibrated differently, not pixel-identical.
 
-During later compiler pressure, the kernel moved 25.9 MiB of the same process's cold private pages to swap while resident private memory fell to 4.2 MiB; `RssAnon + VmSwap` remained about 30.1 MiB. Swap by itself is therefore not a leak signal—watch whether the combined private footprint keeps growing.
-
-A paired GNOME System Monitor process-details capture after that reclamation showed:
-
-| Displayed metric | Lightwatch | GNOME System Monitor | Lightwatch share |
-|------------------|------------|----------------------|------------------|
-| Memory | 4.2 MiB | 78.9 MiB | 5.3% |
-| Resident Memory | 63.1 MiB | 211.8 MiB | 29.8% |
-| Shared Memory | 58.9 MiB | 132.9 MiB | 44.3% |
-| Virtual Memory | 764.3 MiB | 2.5 GiB | ~29.9% |
-| CPU at capture | 0.13% | 0.80% | 16.3% |
-
-In both windows, GNOME's displayed `Memory` is exactly `Resident Memory − Shared Memory`. It therefore excludes Lightwatch's swapped pages: the 4.2 MiB display is a resident number, while the contemporaneous `RssAnon + VmSwap` value was 30.1 MiB. Even that combined Lightwatch value was only about 38% of GNOME System Monitor's resident-private figure. Virtual memory is reserved address space rather than physical RAM, and the CPU row is an instantaneous reading; the 60-second 0.68% measurement above is the steadier Lightwatch result.
-
-Release-mode geometry stress tests cover 256 series × 7,200 points. Ordinary gap-free history is pixel-bounded; the ring capacity remains the hard bound for fragmented input. The 256-series bursty case completes in roughly 22 ms on this machine.
+Geometry stress: 256 series × 7,200 points; bursty case ~22 ms on this machine.
 
 ## Why numbers differ from GNOME System Monitor
 
-- **Process memory** — Lightwatch’s process table uses **`RssAnon`** (private anonymous). GNOME’s process-details `Memory` has been observed as resident minus shared in paired captures (closer to private total, not pure Anon). Swapped private pages are outside both UIs unless you track `RssAnon + VmSwap` over time.
-- **Process CPU %** — Lightwatch shows share of **total** machine capacity (same spirit as GNOME’s process list). Per-core charts on Resources remain 0–100% of that core.
-- **Memory “used”** — we use `MemTotal − MemAvailable`. GNOME often reports a different used/cache split; totals and “pressure” semantics won’t match line-for-line.
-- **Overall CPU** — aggregate `%` is from the `cpu` line; GNOME’s multi-core view weights cores visually. Sampling phase and window also differ.
-- **VRAM / GPU** — different sources (sysfs vs NVML vs GNOME’s path) and units.
-
-Treat lightwatch as its own instrument, calibrated for leave-it-open cost, not pixel-identical to GNOME.
+- **Process memory** — Lightwatch uses `RssAnon`; GSM’s column is often closer to resident − shared.
+- **Process CPU %** — both aim at total machine share; sampling windows still differ.
+- **System “used” RAM** — we use `MemTotal − MemAvailable`.
+- **GPU / VRAM** — different sources (sysfs, NVML, GNOME’s path).
 
 ## Develop
 
@@ -145,7 +118,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-Local plans for agent workflows live under `plans/` (gitignored). Do not add speculative docs trees; keep this README the single source of product/architecture/performance truth.
+Local agent plans live under `plans/` (gitignored). This README is the product/architecture/performance source of truth.
 
 ## License
 
