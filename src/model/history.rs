@@ -102,9 +102,8 @@ pub const MAX_INTERVAL_MS: u64 = 60_000;
 pub const MAX_WINDOW_SECS: u64 = 7200; // 2 hours
 pub const MAX_POINTS_PER_SERIES: usize = 7200;
 /// Extra samples beyond `floor(window/interval)` for edge geometry:
-/// - 3 off-left neighbors (stable monotone-cubic tangents at left clip;
-///   the third prevents the leftmost culled point from becoming the spline
-///   endpoint during sub-interval window scroll).
+/// - 3 off-left neighbors (stable raw context at the left clip across
+///   sub-interval scroll and decimation changes).
 /// - 2 off-right neighbors (final-shape segments scrolling in from the right).
 /// - The two-interval diagnostic delay requires two future samples beyond the
 ///   visible right edge, which are covered by the off-right neighbors.

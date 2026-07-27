@@ -1,4 +1,4 @@
-use super::graph::{MultiChart, SeriesData};
+use super::graph::{ChartId, MultiChart, SeriesData};
 use super::graph_geom::DrawWindow;
 use super::prefs::{self, SectionId, SectionVisibility};
 use super::theme;
@@ -11,6 +11,8 @@ use iced::widget::{
     text_input, tooltip,
 };
 use iced::{Alignment, Color, Element, Length, Size, Subscription, Theme};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -50,6 +52,25 @@ pub struct LayoutPlan {
     pub gpu_collapsed: usize,
     /// Logical cores for CPU legend row estimate (when CPU expanded).
     pub cpu_cores: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ChartView {
+    window_secs: f64,
+    window_end_ns: u64,
+    interval_ns: u64,
+    flex: bool,
+    animate: bool,
+}
+
+impl ChartView {
+    fn window(self) -> DrawWindow {
+        DrawWindow {
+            sample_interval_ns: self.interval_ns,
+            window_secs: self.window_secs,
+            window_end_ns: self.window_end_ns,
+        }
+    }
 }
 
 impl LayoutPlan {
@@ -118,6 +139,7 @@ pub struct Lightwatch {
     /// Boottime-domain timestamp for chart motion, derived from the scheduled
     /// display deadline rather than callback delivery time.
     chart_now_ns: Option<u64>,
+    chart_inputs: ChartInputs,
     config: HistoryConfig,
     selected_preset: HistoryPreset,
     presets: Vec<HistoryPreset>,
@@ -131,6 +153,159 @@ pub struct Lightwatch {
     selected_process: Option<ProcessId>,
     /// Soft status under End Process (signal sent / denied / gone).
     process_status: Option<String>,
+}
+
+struct GpuChartInputs {
+    pci_id: Arc<str>,
+    content_signature: u64,
+    series: Vec<SeriesData>,
+}
+
+#[derive(Default)]
+struct ChartInputs {
+    generation: u64,
+    cpu_ids: Vec<CoreId>,
+    cpu_legend_labels: Vec<String>,
+    cpu_count_label: String,
+    cpu_content_signature: u64,
+    cpu_series: Vec<SeriesData>,
+    memory_content_signature: u64,
+    memory_series: Vec<SeriesData>,
+    gpu_series: Vec<GpuChartInputs>,
+}
+
+impl ChartInputs {
+    fn from_published(generation: u64, published: &Published) -> Self {
+        let snap = &published.snapshot;
+        let hist = &published.history;
+
+        let cpu_ids = hist
+            .cpu_per_core
+            .iter()
+            .map(|(core_id, _)| *core_id)
+            .collect::<Vec<_>>();
+        let cpu_series: Vec<SeriesData> = hist
+            .cpu_per_core
+            .iter()
+            .map(|(core_id, ring)| SeriesData {
+                points: Arc::from(ring.points()),
+                color: theme::core_color(core_id.0),
+                max_value: 100.0,
+                fill: false,
+                line_alpha: Some(0.80),
+            })
+            .collect();
+        let cpu_content_signature =
+            chart_content_signature(&cpu_series, cpu_ids.iter().map(|id| u64::from(id.0)));
+        let cpu_legend_labels = cpu_ids
+            .iter()
+            .map(|core_id| {
+                let percent = snap
+                    .cpu
+                    .per_core_percent
+                    .iter()
+                    .find(|reading| reading.id == *core_id)
+                    .and_then(|reading| match &reading.value {
+                        Reading::Value(value) => Some(format!("{value:3.0}%")),
+                        Reading::Unavailable { .. } => None,
+                    })
+                    .unwrap_or_else(|| "  —".to_owned());
+                format!("{} {percent}", core_id.label())
+            })
+            .collect();
+        let cpu_count_label = if snap.cpu.core_hidden > 0 {
+            format!(
+                "{} core(s) (+{} hidden)",
+                cpu_ids.len(),
+                snap.cpu.core_hidden
+            )
+        } else {
+            format!("{} core(s)", cpu_ids.len())
+        };
+
+        let mut memory_series = vec![SeriesData {
+            points: Arc::from(hist.mem_used.points()),
+            color: theme::ACCENT_MEM,
+            max_value: (snap.memory.total_kb as f32).max(1.0),
+            fill: true,
+            line_alpha: None,
+        }];
+        if let Reading::Value(swap_total) = snap.memory.swap_total_kb
+            && swap_total > 0
+        {
+            memory_series.push(SeriesData {
+                points: Arc::from(hist.swap_used.points()),
+                color: theme::ACCENT_SWAP,
+                max_value: swap_total as f32,
+                fill: false,
+                line_alpha: None,
+            });
+        }
+        let memory_content_signature =
+            chart_content_signature(&memory_series, 0..memory_series.len() as u64);
+
+        let gpu_series = hist
+            .gpu_series
+            .iter()
+            .map(|gpu| {
+                let series = vec![SeriesData {
+                    points: Arc::from(gpu.util.points()),
+                    color: theme::ACCENT_GPU,
+                    max_value: 100.0,
+                    fill: true,
+                    line_alpha: None,
+                }];
+                GpuChartInputs {
+                    pci_id: Arc::from(gpu.pci_id.as_str()),
+                    content_signature: chart_content_signature(&series, [0]),
+                    series,
+                }
+            })
+            .collect();
+
+        Self {
+            generation,
+            cpu_ids,
+            cpu_legend_labels,
+            cpu_count_label,
+            cpu_content_signature,
+            cpu_series,
+            memory_content_signature,
+            memory_series,
+            gpu_series,
+        }
+    }
+
+    fn gpu(&self, pci_id: &str) -> Option<&GpuChartInputs> {
+        self.gpu_series
+            .iter()
+            .find(|gpu| gpu.pci_id.as_ref() == pci_id)
+    }
+}
+
+/// Fingerprint the generation-scoped inputs that can alter canonical paths
+/// without inspecting every sample. The publication generation remains the
+/// sole epoch for point content; this covers membership, scale, and style.
+fn chart_content_signature(
+    series: &[SeriesData],
+    membership: impl IntoIterator<Item = u64>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    series.len().hash(&mut hasher);
+    for member in membership {
+        member.hash(&mut hasher);
+    }
+    for item in series {
+        item.points.len().hash(&mut hasher);
+        item.max_value.to_bits().hash(&mut hasher);
+        item.color.r.to_bits().hash(&mut hasher);
+        item.color.g.to_bits().hash(&mut hasher);
+        item.color.b.to_bits().hash(&mut hasher);
+        item.color.a.to_bits().hash(&mut hasher);
+        item.fill.hash(&mut hasher);
+        item.line_alpha.map(f32::to_bits).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +384,7 @@ pub fn boot(config: HistoryConfig) -> (Lightwatch, iced::Task<Message>) {
         published: None,
         last_seen_gen: 0,
         chart_now_ns: None,
+        chart_inputs: ChartInputs::default(),
         config,
         selected_preset: initial_preset,
         presets: HistoryPreset::all(),
@@ -253,6 +429,7 @@ pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
                 {
                     app.selected_process = None;
                 }
+                app.chart_inputs = ChartInputs::from_published(g, &pubd);
                 app.published = Some(pubd);
             }
             iced::Task::none()
@@ -373,7 +550,7 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
     let chrome = tab_chrome(app, snap);
 
     let body: Element<'_, Message> = match app.active_tab {
-        AppTab::Resources => resources_body(app, snap, &published.history),
+        AppTab::Resources => resources_body(app, snap),
         AppTab::Processes => processes_body(app, snap),
         AppTab::Health => health_body(snap),
     };
@@ -484,11 +661,7 @@ fn process_search_trailing(app: &Lightwatch, match_count: usize) -> Element<'_, 
         .into()
 }
 
-fn resources_body<'a>(
-    app: &'a Lightwatch,
-    snap: &'a Snapshot,
-    hist: &'a History,
-) -> Element<'a, Message> {
+fn resources_body<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Message> {
     let window_secs = app.config.window.as_secs_f64();
     // Two-interval diagnostic look-ahead: chart "now" lags wall clock by two
     // sample intervals so the next two real samples sit off-screen right and
@@ -506,30 +679,44 @@ fn resources_body<'a>(
         .filter(|g| app.visibility.is_gpu_visible(&g.pci_id))
         .count();
     let gpu_collapsed = snap.gpus.len().saturating_sub(gpu_expanded);
+    let any_expanded = app.visibility.show_cpu || app.visibility.show_memory || gpu_expanded > 0;
+    let animate = resource_chart_animation_active(app.active_tab, true, any_expanded);
     let layout_plan = LayoutPlan {
         cpu_expanded: app.visibility.show_cpu,
         memory_expanded: app.visibility.show_memory,
         gpu_expanded,
         gpu_collapsed,
-        cpu_cores: hist.cpu_per_core.len(),
+        cpu_cores: app.chart_inputs.cpu_ids.len(),
     };
 
     let vis = app.visibility.clone();
+    let chart_inputs = &app.chart_inputs;
     responsive(move |size: Size| {
         let flex = use_flex(size.height, &layout_plan);
         build_sections(
             snap,
-            hist,
-            window_secs,
-            window_end_ns,
-            interval_ns,
+            chart_inputs,
             &vis,
-            flex,
+            ChartView {
+                window_secs,
+                window_end_ns,
+                interval_ns,
+                flex,
+                animate,
+            },
         )
     })
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
+}
+
+fn resource_chart_animation_active(
+    active_tab: AppTab,
+    has_publication: bool,
+    any_expanded: bool,
+) -> bool {
+    active_tab == AppTab::Resources && has_publication && any_expanded
 }
 
 fn health_body(snap: &Snapshot) -> Element<'static, Message> {
@@ -1003,52 +1190,54 @@ fn process_row(row: &ProcessRow, selected: bool) -> Element<'static, Message> {
 
 fn build_sections<'a>(
     snap: &'a Snapshot,
-    hist: &'a History,
-    window_secs: f64,
-    window_end_ns: u64,
-    interval_ns: u64,
+    chart_inputs: &'a ChartInputs,
     vis: &SectionVisibility,
-    flex: bool,
+    chart_view: ChartView,
 ) -> Element<'a, Message> {
     let mut sections: Vec<Element<'a, Message>> = Vec::new();
+    let mut animation_driver_claimed = false;
 
-    // Headers always present (GSM); body only when expanded.
-    sections.push(cpu_section(
-        snap,
-        hist,
-        window_secs,
-        window_end_ns,
-        interval_ns,
-        flex,
-        vis.show_cpu,
-    ));
+    // Headers always present (GSM); body only when expanded. One visible
+    // Canvas drives the window redraw chain; every Canvas still draws on each
+    // resulting window frame.
+    let cpu_view = claim_animation_driver(
+        chart_view,
+        vis.show_cpu && !chart_inputs.cpu_series.is_empty(),
+        &mut animation_driver_claimed,
+    );
+    sections.push(cpu_section(snap, chart_inputs, vis.show_cpu, cpu_view));
+    let memory_view = claim_animation_driver(
+        chart_view,
+        vis.show_memory && !chart_inputs.memory_series.is_empty(),
+        &mut animation_driver_claimed,
+    );
     sections.push(memory_section(
         snap,
-        hist,
-        window_secs,
-        window_end_ns,
-        interval_ns,
-        flex,
+        chart_inputs,
         vis.show_memory,
+        memory_view,
     ));
     for gpu in snap.gpus.iter() {
         let expanded = vis.is_gpu_visible(&gpu.pci_id);
-        let gpu_hist = hist.gpu_series.iter().find(|gh| gh.pci_id == gpu.pci_id);
+        let gpu_inputs = chart_inputs.gpu(&gpu.pci_id);
+        let gpu_view = claim_animation_driver(
+            chart_view,
+            expanded && gpu_inputs.is_some_and(|inputs| !inputs.series.is_empty()),
+            &mut animation_driver_claimed,
+        );
         sections.push(gpu_section(
             gpu,
-            gpu_hist,
-            window_secs,
-            window_end_ns,
-            interval_ns,
-            flex,
+            gpu_inputs,
+            chart_inputs.generation,
             expanded,
+            gpu_view,
         ));
     }
 
     let any_expanded =
         vis.show_cpu || vis.show_memory || snap.gpus.iter().any(|g| vis.is_gpu_visible(&g.pci_id));
     // Flex only when at least one body is open; otherwise headers just stack.
-    let use_fill = flex && any_expanded;
+    let use_fill = chart_view.flex && any_expanded;
 
     let col = column(sections)
         .spacing(SECTION_GAP)
@@ -1067,6 +1256,16 @@ fn build_sections<'a>(
             .height(Length::Fill)
             .into()
     }
+}
+
+fn claim_animation_driver(
+    mut chart_view: ChartView,
+    eligible: bool,
+    driver_claimed: &mut bool,
+) -> ChartView {
+    chart_view.animate = chart_view.animate && eligible && !*driver_claimed;
+    *driver_claimed |= chart_view.animate;
+    chart_view
 }
 
 /// Subscription function: 100ms display tick.
@@ -1180,26 +1379,16 @@ fn section_portion(expanded: bool, flex: bool) -> Length {
 // Section builders
 // ---------------------------------------------------------------------------
 
-fn cpu_section(
-    snap: &Snapshot,
-    hist: &History,
-    window_secs: f64,
-    window_end_ns: u64,
-    interval_ns: u64,
-    flex: bool,
+fn cpu_section<'a>(
+    snap: &'a Snapshot,
+    chart_inputs: &'a ChartInputs,
     expanded: bool,
-) -> Element<'static, Message> {
+    chart_view: ChartView,
+) -> Element<'a, Message> {
     let cpu = &snap.cpu;
     let usage = rfmt(&cpu.usage_percent, |v| format!("{v:.1}%"));
     let temp = rfmt_opt(&cpu.temp_celsius, |v| format!("{v:.1}°C"));
     let freq = rfmt_opt(&cpu.freq_mhz, |v| format!("{v:.0} MHz"));
-
-    let core_count = format!("{} core(s)", hist.cpu_per_core.len());
-    let hidden_text = if cpu.core_hidden > 0 {
-        format!(" (+{} hidden)", cpu.core_hidden)
-    } else {
-        String::new()
-    };
 
     // GSM: ▾/▸ + title + live summary (summary stays when collapsed).
     let header_rest = row![
@@ -1211,7 +1400,7 @@ fn cpu_section(
         Space::new().width(12),
         text(freq).size(12).color(theme::TEXT),
         Space::new().width(Length::Fill),
-        text(format!("{}{}", core_count, hidden_text))
+        text(chart_inputs.cpu_count_label.as_str())
             .size(11)
             .color(theme::TEXT_DIM),
     ]
@@ -1220,29 +1409,21 @@ fn cpu_section(
     let header = with_disclosure(expanded, SectionId::Cpu, header_rest.into());
 
     let body = if expanded {
-        let mut chart = MultiChart::new(true);
-        for (core_id, ring) in &hist.cpu_per_core {
-            let color = theme::core_color(core_id.0);
-            chart.series.push(SeriesData {
-                points: ring.points(),
-                color,
-                max_value: 100.0,
-                fill: false,
-                line_alpha: Some(0.80),
-            });
-        }
-        chart.window = DrawWindow {
-            sample_interval_ns: interval_ns,
-            window_secs,
-            window_end_ns,
-        };
+        let mut chart = MultiChart::new(
+            ChartId::Cpu,
+            chart_inputs.generation,
+            chart_inputs.cpu_content_signature,
+            &chart_inputs.cpu_series,
+            true,
+        );
+        chart.window = chart_view.window();
+        chart.animate = chart_view.animate;
 
         let canvas = Canvas::new(chart)
             .width(Length::Fill)
-            .height(chart_height(flex, MIN_CPU_CHART));
+            .height(chart_height(chart_view.flex, MIN_CPU_CHART));
 
-        let cores = &hist.cpu_per_core;
-        let n = cores.len();
+        let n = chart_inputs.cpu_ids.len();
         let per_col = n.div_ceil(4).max(1);
         let mut legend_cols: Vec<Element<Message>> = Vec::with_capacity(4);
         for col_idx in 0..4 {
@@ -1252,23 +1433,10 @@ fn cpu_section(
                 legend_cols.push(column![Space::new().height(1)].width(Length::Fill).into());
                 continue;
             }
-            let items: Vec<Element<Message>> = cores[start..end]
+            let items: Vec<Element<Message>> = chart_inputs.cpu_ids[start..end]
                 .iter()
-                .map(|(core_id, _ring)| {
-                    let pct_str = snap
-                        .cpu
-                        .per_core_percent
-                        .iter()
-                        .find(|cr| cr.id == *core_id)
-                        .and_then(|cr| match &cr.value {
-                            Reading::Value(v) => Some(format!("{v:3.0}%")),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| "  —".to_string());
-                    let color = theme::core_color(core_id.0);
-                    let label = format!("{} {}", core_id.label(), pct_str);
-                    legend_chip_fixed(&label, color)
-                })
+                .zip(&chart_inputs.cpu_legend_labels[start..end])
+                .map(|(core_id, label)| legend_chip_fixed(label, theme::core_color(core_id.0)))
                 .collect();
             legend_cols.push(column(items).spacing(2).width(Length::Fill).into());
         }
@@ -1276,31 +1444,31 @@ fn cpu_section(
         Some(
             column![canvas, legend]
                 .spacing(4)
-                .height(if flex { Length::Fill } else { Length::Shrink })
+                .height(if chart_view.flex {
+                    Length::Fill
+                } else {
+                    Length::Shrink
+                })
                 .into(),
         )
     } else {
         None
     };
 
-    let card = panel(header, body, expanded, flex);
+    let card = panel(header, body, expanded, chart_view.flex);
     container(card)
         .width(Length::Fill)
-        .height(section_portion(expanded, flex))
+        .height(section_portion(expanded, chart_view.flex))
         .into()
 }
 
-fn memory_section(
-    snap: &Snapshot,
-    hist: &History,
-    window_secs: f64,
-    window_end_ns: u64,
-    interval_ns: u64,
-    flex: bool,
+fn memory_section<'a>(
+    snap: &'a Snapshot,
+    chart_inputs: &'a ChartInputs,
     expanded: bool,
-) -> Element<'static, Message> {
+    chart_view: ChartView,
+) -> Element<'a, Message> {
     let mem = &snap.memory;
-    let max_mem = mem.total_kb as f32;
     let used = rfmt(&mem.used_kb, |v| {
         format!("{:.1} GiB", *v as f64 / 1_048_576.0)
     });
@@ -1346,62 +1514,48 @@ fn memory_section(
         ]
         .spacing(0);
 
-        let mut chart = MultiChart::new(false);
-        chart.series.push(SeriesData {
-            points: hist.mem_used.points(),
-            color: theme::ACCENT_MEM,
-            max_value: max_mem.max(1.0),
-            fill: true,
-            line_alpha: None,
-        });
-
-        if let Reading::Value(swap_total) = mem.swap_total_kb
-            && swap_total > 0
-        {
-            chart.series.push(SeriesData {
-                points: hist.swap_used.points(),
-                color: theme::ACCENT_SWAP,
-                max_value: swap_total as f32,
-                fill: false,
-                line_alpha: None,
-            });
-        }
-        chart.window = DrawWindow {
-            sample_interval_ns: interval_ns,
-            window_secs,
-            window_end_ns,
-        };
+        let mut chart = MultiChart::new(
+            ChartId::Memory,
+            chart_inputs.generation,
+            chart_inputs.memory_content_signature,
+            &chart_inputs.memory_series,
+            false,
+        );
+        chart.window = chart_view.window();
+        chart.animate = chart_view.animate;
 
         let canvas = Canvas::new(chart)
             .width(Length::Fill)
-            .height(chart_height(flex, MIN_MEM_CHART));
+            .height(chart_height(chart_view.flex, MIN_MEM_CHART));
 
         Some(
             column![stats, canvas]
                 .spacing(4)
-                .height(if flex { Length::Fill } else { Length::Shrink })
+                .height(if chart_view.flex {
+                    Length::Fill
+                } else {
+                    Length::Shrink
+                })
                 .into(),
         )
     } else {
         None
     };
 
-    let card = panel(header, body, expanded, flex);
+    let card = panel(header, body, expanded, chart_view.flex);
     container(card)
         .width(Length::Fill)
-        .height(section_portion(expanded, flex))
+        .height(section_portion(expanded, chart_view.flex))
         .into()
 }
 
-fn gpu_section(
-    gpu: &GpuSnapshot,
-    gpu_hist: Option<&GpuHistory>,
-    window_secs: f64,
-    window_end_ns: u64,
-    interval_ns: u64,
-    flex: bool,
+fn gpu_section<'a>(
+    gpu: &'a GpuSnapshot,
+    gpu_inputs: Option<&'a GpuChartInputs>,
+    generation: u64,
     expanded: bool,
-) -> Element<'static, Message> {
+    chart_view: ChartView,
+) -> Element<'a, Message> {
     let util = rfmt(&gpu.util_percent, |v| format!("{v:5.1}%"));
     let vram = match (&gpu.vram_used_kb, &gpu.vram_total_kb) {
         (Reading::Value(u), Reading::Value(t)) => {
@@ -1446,38 +1600,38 @@ fn gpu_section(
         .spacing(0);
 
         let mut body_col = column![stats].spacing(4);
-        if let Some(gh) = gpu_hist {
-            let mut chart = MultiChart::new(false);
-            chart.series.push(SeriesData {
-                points: gh.util.points(),
-                color: theme::ACCENT_GPU,
-                max_value: 100.0,
-                fill: true,
-                line_alpha: None,
-            });
-            chart.window = DrawWindow {
-                sample_interval_ns: interval_ns,
-                window_secs,
-                window_end_ns,
-            };
+        if let Some(inputs) = gpu_inputs {
+            let mut chart = MultiChart::new(
+                ChartId::Gpu(Arc::clone(&inputs.pci_id)),
+                generation,
+                inputs.content_signature,
+                &inputs.series,
+                false,
+            );
+            chart.window = chart_view.window();
+            chart.animate = chart_view.animate;
             let canvas = Canvas::new(chart)
                 .width(Length::Fill)
-                .height(chart_height(flex, MIN_GPU_CHART));
+                .height(chart_height(chart_view.flex, MIN_GPU_CHART));
             body_col = body_col.push(canvas);
         }
         Some(
             body_col
-                .height(if flex { Length::Fill } else { Length::Shrink })
+                .height(if chart_view.flex {
+                    Length::Fill
+                } else {
+                    Length::Shrink
+                })
                 .into(),
         )
     } else {
         None
     };
 
-    let card = panel(header, body, expanded, flex);
+    let card = panel(header, body, expanded, chart_view.flex);
     container(card)
         .width(Length::Fill)
-        .height(section_portion(expanded, flex))
+        .height(section_portion(expanded, chart_view.flex))
         .into()
 }
 
@@ -1559,8 +1713,7 @@ fn stat_box_fixed(
 
 /// Full-width legend chip for the 4-column CPU legend — fills its column so
 /// digit-width changes in the percentage do not shove neighboring chips.
-fn legend_chip_fixed(label: &str, color: Color) -> Element<'static, Message> {
-    let label_owned = label.to_owned();
+fn legend_chip_fixed<'a>(label: &'a str, color: Color) -> Element<'a, Message> {
     let swatch = container(Space::new().width(8).height(8)).style(move |_theme| container::Style {
         background: Some(iced::Background::Color(color)),
         ..Default::default()
@@ -1568,7 +1721,7 @@ fn legend_chip_fixed(label: &str, color: Color) -> Element<'static, Message> {
     row![
         swatch,
         Space::new().width(6),
-        text(label_owned).size(11).color(theme::TEXT_DIM),
+        text(label).size(11).color(theme::TEXT_DIM),
     ]
     .align_y(Alignment::Center)
     .width(Length::Fill)
@@ -1637,6 +1790,78 @@ mod display_clock_tests {
         let next = chart_boottime_ns(next_deadline, next_now, BOOT_BASE_NS + 340_000_000);
 
         assert_eq!(next - first, 300_000_000);
+    }
+
+    #[test]
+    fn compositor_animation_is_resources_only_and_requires_live_visible_work() {
+        assert!(resource_chart_animation_active(
+            AppTab::Resources,
+            true,
+            true
+        ));
+        assert!(!resource_chart_animation_active(
+            AppTab::Processes,
+            true,
+            true
+        ));
+        assert!(!resource_chart_animation_active(
+            AppTab::Resources,
+            false,
+            true
+        ));
+        assert!(!resource_chart_animation_active(
+            AppTab::Resources,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn exactly_one_eligible_canvas_drives_window_redraws() {
+        let view = ChartView {
+            window_secs: 60.0,
+            window_end_ns: 1_000,
+            interval_ns: 1_000_000_000,
+            flex: true,
+            animate: true,
+        };
+        let mut claimed = false;
+
+        assert!(!claim_animation_driver(view, false, &mut claimed).animate);
+        assert!(claim_animation_driver(view, true, &mut claimed).animate);
+        assert!(claimed);
+        assert!(!claim_animation_driver(view, true, &mut claimed).animate);
+
+        let mut disabled_claimed = false;
+        let disabled = ChartView {
+            animate: false,
+            ..view
+        };
+        assert!(!claim_animation_driver(disabled, true, &mut disabled_claimed).animate);
+        assert!(!disabled_claimed);
+    }
+
+    #[test]
+    fn content_signature_tracks_membership_scale_and_style() {
+        let points: Arc<[SamplePoint]> = Arc::from([
+            SamplePoint::new(1_000_000_000, 10.0),
+            SamplePoint::new(2_000_000_000, 20.0),
+        ]);
+        let mut series = vec![SeriesData {
+            points,
+            color: Color::from_rgb(0.2, 0.4, 0.6),
+            max_value: 100.0,
+            fill: false,
+            line_alpha: Some(0.8),
+        }];
+        let original = chart_content_signature(&series, [0]);
+
+        assert_ne!(original, chart_content_signature(&series, [1]));
+        series[0].max_value = 200.0;
+        assert_ne!(original, chart_content_signature(&series, [0]));
+        series[0].max_value = 100.0;
+        series[0].fill = true;
+        assert_ne!(original, chart_content_signature(&series, [0]));
     }
 }
 

@@ -68,7 +68,7 @@ UI (iced)  ←── notify + pull latest Arc ──  Sampler thread
 |------|------|
 | Snapshots | Immutable each tick; process + health rows latest-only (no rings) |
 | History | Fixed rings; `capacity = floor(window/interval) + 6` ≤ **7206** |
-| Charts | Scheduled 100 ms display clock converted to `CLOCK_BOOTTIME`; two-interval look-ahead; pixel-stable edges; gaps stay gaps |
+| Charts | Canvas-local compositor redraw; GSM-style horizontal-tangent easing; two-interval look-ahead; pixel-stable edges; gaps stay gaps |
 | Handoff | Single-slot latest; never a queue |
 | Time | `CLOCK_BOOTTIME` sample stamps |
 | Scheduler | Deadline ticks; late → skip |
@@ -89,13 +89,28 @@ TEA UI; collectors stay UI-agnostic.
 
 ## Performance
 
-Bounded by design: one sampler thread, one Tokio worker by default, single-slot handoff, fixed history, 100 ms display tick vs 1 Hz sample.
+Bounded by design: one sampler thread, one Tokio worker by default, single-slot handoff, fixed history, 100 ms publication polling, and compositor-paced drawing only while expanded Resource charts exist. Rings linearize once per publication; cached axes and canonical curve paths do not rebuild per frame.
 
-Measured on Pop!_OS 24.04 COSMIC Wayland, **Ryzen 9 6900HS**, AMD 680M + RTX 3050 Mobile, release GUI after history warm-up:
+Pre-change baseline measured 2026-07-17 on Pop!_OS 24.04 COSMIC Wayland,
+**Ryzen 9 6900HS**, AMD 680M + RTX 3050 Mobile, release GUI after history
+warm-up. These numbers predate compositor-paced chart motion:
 
 | Resident private (`RssAnon`) | Total RSS | Threads | Swap | CPU |
 |------------------------------|-----------|---------|------|-----|
 | 28.7 MiB | 88.8 MiB | 7 | 0 | 0.68% of one logical CPU |
+
+Current installed build measured 2026-07-27 on the same machine:
+
+| State | Resident private (`RssAnon`) | Total RSS | Threads | Swap | CPU |
+|-------|------------------------------|-----------|---------|------|-----|
+| Resources expanded | 29.6 MiB | 90.4 MiB | 7 | 0 | 18.70% of one logical CPU |
+| All charts collapsed | 28.6 MiB | 89.6 MiB | 7 | 0 | 4.97% of one logical CPU |
+
+The preserved pre-change binary measured 5.40% expanded and 4.45% collapsed
+in the same session, so current desktop conditions do not reproduce the older
+0.68% result. Compositor motion adds about 0.13 logical core while charts are
+visible; collapsed charts stop the redraw chain. One visible Canvas drives
+window redraws for all charts.
 
 `RssAnon` is private footprint; total RSS includes shared/file maps (and GPU mappings). For leak watching under swap, use **`RssAnon + VmSwap`** — a long run held ~29.5–30.3 MiB private with zero swap; under compiler pressure resident Anon fell to 4.2 MiB while Anon+Swap stayed ~30.1 MiB. Headless `--once` / `--soak` is about 0.9 MiB Anon / 6.5 MiB RSS here.
 

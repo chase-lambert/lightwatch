@@ -1,5 +1,5 @@
-//! Pure graph geometry: age-based X mapping, gap splitting, monotone-cubic
-//! smoothing, axis ticks. No iced dependencies.
+//! Pure graph geometry: age-based X mapping, gap splitting, horizontal-tangent
+//! easing, axis ticks. No iced dependencies.
 //!
 //! Returns Bézier curve segments and tick positions; the canvas layer in
 //! `graph.rs` renders them.
@@ -428,64 +428,12 @@ fn decimate_points_with_stencil(
 }
 
 // ---------------------------------------------------------------------------
-// Monotone-cubic (Fritsch–Carlson) smoothing → Bézier segments
+// Horizontal-tangent easing → Bézier segments
 // ---------------------------------------------------------------------------
 
-/// Fritsch–Carlson interior tangent at point `i` given left slope `sL`,
-/// right slope `sR`, left interval length `hL`, and right interval length `hR`.
-fn interior_tangent(sl: f32, sr: f32, hl: f32, hr: f32) -> f32 {
-    // If slopes have opposite signs or either is zero, tangent = 0 (local extremum)
-    if sl * sr <= 0.0 {
-        return 0.0;
-    }
-
-    // Weighted harmonic mean (Fritsch–Carlson 1980)
-    let wl = 2.0 * hr + hl;
-    let wr = hr + 2.0 * hl;
-    let d = (wl + wr) / (wl / sl + wr / sr);
-
-    // Monotonicity safeguard: the tangent magnitude must not exceed
-    // 3× the smallest adjacent slope magnitude.
-    let max_slope = 3.0 * sl.abs().min(sr.abs());
-    if d.abs() > max_slope {
-        d.signum() * max_slope
-    } else {
-        d
-    }
-}
-
-/// Endpoint tangent using the Fritsch–Carlson one-sided quadratic estimate,
-/// clamped for monotonicity.
-fn endpoint_tangent(s0: f32, s1: f32, h0: f32, h1: f32) -> f32 {
-    // Quadratic estimate
-    let d = ((2.0 * h0 + h1) * s0 - h0 * s1) / (h0 + h1);
-
-    // If the tangent points opposite to the initial slope, clamp to zero
-    if d * s0 <= 0.0 {
-        return 0.0;
-    }
-    // If slopes have opposite signs, the tangent must not exceed 3×|s0|
-    if s0 * s1 <= 0.0 && d.abs() > 3.0 * s0.abs() {
-        3.0 * s0
-    } else {
-        d
-    }
-}
-
-/// Compute tangent-magnitude upper bound for endpoint monotonicity.
-/// For endpoint with adjacent slope `s0`, the tangent must not exceed
-/// 3×|s0| to prevent overshoot into the first interval.
-fn endpoint_clamp(d: f32, s0: f32) -> f32 {
-    let limit = 3.0 * s0.abs();
-    if d.abs() > limit {
-        d.signum() * limit
-    } else {
-        d
-    }
-}
-
-/// Compute monotone-cubic Bézier pieces for a gap-free run of (x, y) points.
-/// Returns a vec of `BezierSeg` — one per adjacent pair.
+/// Compute GSM-style Bézier pieces for a gap-free run of (x, y) points.
+/// Each real sample is a horizontal tangent. Control-point Y stays at an
+/// endpoint value, so the curve cannot overshoot either adjacent sample.
 ///
 /// Assumes strictly increasing x (the caller must skip/coalesce `dx ≤ 0`
 /// points first — see `coalesce_degenerate_x`).
@@ -495,77 +443,26 @@ fn smooth_run(points: &[(f32, f32)]) -> Vec<BezierSeg> {
         return vec![];
     }
 
-    let xs: Vec<f32> = points.iter().map(|p| p.0).collect();
-    let ys: Vec<f32> = points.iter().map(|p| p.1).collect();
-
-    // Compute slopes
-    let mut dx: Vec<f32> = Vec::with_capacity(n - 1);
-    let mut slopes: Vec<f32> = Vec::with_capacity(n - 1);
-    for i in 0..n - 1 {
-        let dxi = xs[i + 1] - xs[i];
-        dx.push(dxi);
-        if dxi > 0.0 {
-            slopes.push((ys[i + 1] - ys[i]) / dxi);
-        } else {
-            slopes.push(0.0); // degenerate; shouldn't happen after coalesce
-        }
-    }
-
-    // Compute tangents
-    let mut tangents = vec![0.0f32; n];
-
-    if n == 2 {
-        // Single interval: use secant slope as tangent (monotone line)
-        let s = slopes[0];
-        tangents[0] = endpoint_clamp(s, s);
-        tangents[1] = endpoint_clamp(s, s);
-    } else {
-        // Endpoints
-        tangents[0] = endpoint_tangent(slopes[0], slopes[1], dx[0], dx[1]);
-        tangents[n - 1] = {
-            let i = n - 1;
-            let j = i - 1;
-            let k = i - 2;
-            let dl = slopes[k];
-            let dr = slopes[j];
-            let hl = dx[k];
-            let hr = dx[j];
-            endpoint_tangent(dr, dl, hr, hl)
-        };
-
-        // Interior points
-        for i in 1..n - 1 {
-            tangents[i] = interior_tangent(
-                slopes[i - 1], // left slope
-                slopes[i],     // right slope
-                dx[i - 1],     // left interval length
-                dx[i],         // right interval length
-            );
-        }
-    }
-
-    // Build Bézier segments
-    let mut segs = Vec::with_capacity(n - 1);
-    for i in 0..n - 1 {
-        let h = dx[i];
-        let p0 = (xs[i], ys[i]);
-        let p3 = (xs[i + 1], ys[i + 1]);
-        let c1 = (xs[i] + h / 3.0, ys[i] + tangents[i] * h / 3.0);
-        let c2 = (xs[i + 1] - h / 3.0, ys[i + 1] - tangents[i + 1] * h / 3.0);
-        segs.push(BezierSeg {
-            start: p0,
-            c1,
-            c2,
-            end: p3,
-        });
-    }
-    segs
+    points
+        .windows(2)
+        .map(|pair| {
+            let start = pair[0];
+            let end = pair[1];
+            let width = end.0 - start.0;
+            BezierSeg {
+                start,
+                c1: (start.0 + width / 3.0, start.1),
+                c2: (end.0 - width / 3.0, end.1),
+                end,
+            }
+        })
+        .collect()
 }
 
 /// Coalesce points with `dx ≤ 0` (duplicate or non-monotonic timestamps).
 /// Keeps the first of any run of non-strictly-increasing x values, dropping
-/// subsequent degenerate neighbors. This prevents divide-by-zero in smoothing
-/// and invalid tangents (critic finding 5).
+/// subsequent degenerate neighbors. This preserves strict left-to-right
+/// Bézier segments.
 fn coalesce_degenerate_x(coords: &[(f32, f32)]) -> Vec<(f32, f32)> {
     if coords.is_empty() {
         return vec![];
@@ -585,7 +482,7 @@ fn coalesce_degenerate_x(coords: &[(f32, f32)]) -> Vec<(f32, f32)> {
 // ---------------------------------------------------------------------------
 
 /// Compute series geometry: off-screen cull, optional gap-aware decimation,
-/// coordinate mapping, gap splitting, and monotone-cubic Bézier smoothing.
+/// coordinate mapping, gap splitting, and horizontal-tangent Bézier easing.
 pub fn compute_series(
     points: &[SamplePoint],
     max_value: f32,
@@ -686,6 +583,20 @@ pub fn compute_series(
     }
 
     SeriesGeometry { bezier_runs }
+}
+
+/// X translation from geometry anchored at `anchor_window_end_ns` to the
+/// current presentation window. This is absolute, so frame-to-frame rounding
+/// can never accumulate into drift.
+pub fn window_translation_x(
+    anchor_window_end_ns: u64,
+    current_window_end_ns: u64,
+    window_secs: f64,
+    plot_width: f32,
+) -> f32 {
+    let window_ns = (window_secs * 1e9).max(1.0);
+    let elapsed_ns = current_window_end_ns as i128 - anchor_window_end_ns as i128;
+    -(elapsed_ns as f64 / window_ns) as f32 * plot_width
 }
 
 /// Compute Y tick positions and labels for the 0–100% axis.
@@ -1062,6 +973,26 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_easing_is_flat_at_every_real_sample_and_stays_in_range() {
+        let points = [(0.0, 10.0), (10.0, 90.0), (25.0, 30.0)];
+        let segs = smooth_run(&points);
+        assert_eq!(segs.len(), 2);
+
+        for (segment, endpoints) in segs.iter().zip(points.windows(2)) {
+            assert_eq!(segment.c1.1, endpoints[0].1);
+            assert_eq!(segment.c2.1, endpoints[1].1);
+            let min_y = endpoints[0].1.min(endpoints[1].1);
+            let max_y = endpoints[0].1.max(endpoints[1].1);
+            for y in [segment.start.1, segment.c1.1, segment.c2.1, segment.end.1] {
+                assert!((min_y..=max_y).contains(&y));
+            }
+        }
+        assert_eq!(segs[0].end, segs[1].start);
+        assert_eq!(segs[0].c2.1, segs[0].end.1);
+        assert_eq!(segs[1].c1.1, segs[1].start.1);
+    }
+
+    #[test]
     fn smooth_flat_line_is_straight() {
         let segs = smooth_run(&[(0.0, 50.0), (100.0, 50.0), (200.0, 50.0)]);
         // All control points should be along the same horizontal line
@@ -1072,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn smooth_monotone_no_overshoot() {
+    fn smooth_easing_no_overshoot() {
         // Strictly increasing x, strictly increasing y
         let pts: Vec<(f32, f32)> = (0..10).map(|i| (i as f32 * 10.0, i as f32 * 8.0)).collect();
         let segs = smooth_run(&pts);
@@ -1086,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn smooth_monotone_peak_no_overshoot() {
+    fn smooth_easing_peak_no_overshoot() {
         // Peak at middle: no part of curve should exceed the peak
         let pts = vec![
             (0.0, 0.0),
@@ -1730,10 +1661,8 @@ mod tests {
         }
 
         // Wall clock sweeps from 80s to 82s in 0.1s steps.
-        // At 80s, ring holds 16..80. At 81s, pushes 81, evicts 16. At 82s, pushes 82, evicts 17.
         let mut next_push = 80u64;
-        let mut prev_geom: Option<(SeriesGeometry, u64)> = None; // (geom, now_ns)
-
+        let mut prev_geom: Option<(SeriesGeometry, u64)> = None;
         for step in 0..=20u64 {
             let now_ns = 80 * s + step * (s / 10);
             let now_s = now_ns / s;
@@ -1743,11 +1672,9 @@ mod tests {
             }
 
             let geom = geometry_at(&ring, now_ns, delay_ns, &bounds, window_secs);
-
-            // Both clip edges must be spanned by the curve
-            let _y_left = curve_y_at_x(&geom, bounds.left)
+            curve_y_at_x(&geom, bounds.left)
                 .unwrap_or_else(|| panic!("no curve at left clip step {step}"));
-            let _y_right = curve_y_at_x(&geom, bounds.right)
+            curve_y_at_x(&geom, bounds.right)
                 .unwrap_or_else(|| panic!("no curve at right clip step {step}"));
 
             if let Some((ref prev, prev_ns)) = prev_geom {
@@ -1987,23 +1914,6 @@ mod tests {
         let now0 = 55 * s;
         let now1 = 55 * s + 300_000_000; // 0.3s later, no new sample
 
-        let g0 = {
-            let window = DrawWindow {
-                sample_interval_ns: 1_000_000_000,
-                window_secs,
-                window_end_ns: now0.saturating_sub(delay_ns),
-            };
-            compute_series(&pts, 100.0, &window, &bounds, false)
-        };
-        let g1 = {
-            let window = DrawWindow {
-                sample_interval_ns: 1_000_000_000,
-                window_secs,
-                window_end_ns: now1.saturating_sub(delay_ns),
-            };
-            compute_series(&pts, 100.0, &window, &bounds, false)
-        };
-
         let window_ns = (window_secs * 1e9) as u64;
         let dx = age_to_x(
             0,
@@ -2019,7 +1929,22 @@ mod tests {
             bounds.right,
         );
 
-        assert_overlapping_y_stable(&g0, &g1, dx, bounds.left, bounds.right, "sub-frame scroll");
+        let geometry = |now_ns: u64| {
+            let window = DrawWindow {
+                sample_interval_ns: 1_000_000_000,
+                window_secs,
+                window_end_ns: now_ns.saturating_sub(delay_ns),
+            };
+            compute_series(&pts, 100.0, &window, &bounds, false)
+        };
+        assert_overlapping_y_stable(
+            &geometry(now0),
+            &geometry(now1),
+            dx,
+            bounds.left,
+            bounds.right,
+            "sub-frame scroll",
+        );
     }
 
     // ----- delayed continuous window (off-right real samples) -----
@@ -2054,7 +1979,7 @@ mod tests {
 
     #[test]
     fn delayed_window_segment_shape_stable_as_window_advances() {
-        // Non-collinear multi-point set so monotone-cubic is exercised.
+        // Non-collinear multi-point set so horizontal-tangent easing is exercised.
         // Advancing window_end within the same membership interval must only
         // translate X uniformly; control-point Y geometry stays put.
         let bounds = make_bounds();
@@ -2156,5 +2081,34 @@ mod tests {
         assert_eq!(culled.len(), 6, "2 off-left + 2 in + 2 off-right");
         assert_eq!(culled[0].t_boot_ns, 20_000_000_000);
         assert_eq!(culled[5].t_boot_ns, 102_000_000_000);
+    }
+
+    #[test]
+    fn absolute_window_translation_has_no_incremental_drift() {
+        let direct = window_translation_x(10_000_000_000, 10_750_000_000, 60.0, 480.0);
+        let first = window_translation_x(10_000_000_000, 10_250_000_000, 60.0, 480.0);
+        let second = window_translation_x(10_000_000_000, 10_750_000_000, 60.0, 480.0);
+        assert!((direct + 6.0).abs() < f32::EPSILON);
+        assert!((first + 2.0).abs() < f32::EPSILON);
+        assert_eq!(direct, second);
+    }
+
+    #[test]
+    fn easing_preserves_gap_boundaries() {
+        let window = DrawWindow {
+            sample_interval_ns: 1_000_000_000,
+            window_secs: 60.0,
+            window_end_ns: 70_000_000_000,
+        };
+        let bounds = make_bounds();
+        let points = vec![
+            pt(10.0, 10_000_000_000),
+            pt(20.0, 20_000_000_000),
+            gap(30_000_000_000),
+            pt(80.0, 40_000_000_000),
+            pt(90.0, 50_000_000_000),
+        ];
+        let geom = compute_series(&points, 100.0, &window, &bounds, false);
+        assert_eq!(geom.bezier_runs.len(), 2, "easing bridged a gap");
     }
 }
