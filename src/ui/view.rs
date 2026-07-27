@@ -13,6 +13,7 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length, Size, Subscription, Theme};
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Layout constants — chart mins + panel chrome estimates for flex vs scroll
@@ -33,6 +34,7 @@ const LEGEND_ROW_H: f32 = 20.0;
 /// `column(items).spacing(2)` between legend chips in each column.
 const LEGEND_COL_SPACING: f32 = 2.0;
 const SECTION_GAP: f32 = 4.0;
+const DISPLAY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// GSM-like: every *expanded* section gets an equal share of leftover height.
 const WEIGHT_SECTION: u16 = 1;
@@ -113,6 +115,9 @@ pub struct Lightwatch {
     pending_config: Arc<Mutex<Option<HistoryConfig>>>,
     published: Option<Arc<Published>>,
     last_seen_gen: u64,
+    /// Boottime-domain timestamp for chart motion, derived from the scheduled
+    /// display deadline rather than callback delivery time.
+    chart_now_ns: Option<u64>,
     config: HistoryConfig,
     selected_preset: HistoryPreset,
     presets: Vec<HistoryPreset>,
@@ -164,7 +169,7 @@ impl HistoryPreset {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    SampleArrived,
+    DisplayTick(Instant),
     SelectPreset(HistoryPreset),
     ToggleSection(SectionId),
     SelectTab(AppTab),
@@ -203,6 +208,7 @@ pub fn boot(config: HistoryConfig) -> (Lightwatch, iced::Task<Message>) {
         pending_config,
         published: None,
         last_seen_gen: 0,
+        chart_now_ns: None,
         config,
         selected_preset: initial_preset,
         presets: HistoryPreset::all(),
@@ -225,7 +231,12 @@ pub fn title(_app: &Lightwatch) -> String {
 /// Update function
 pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
     match message {
-        Message::SampleArrived => {
+        Message::DisplayTick(deadline) => {
+            app.chart_now_ns = Some(chart_boottime_ns(
+                deadline,
+                Instant::now(),
+                crate::clock_boottime_ns(),
+            ));
             while app.notify_rx.try_recv().is_ok() {}
             if let Some((g, pubd)) = app.latest.pull_if_newer(app.last_seen_gen) {
                 app.last_seen_gen = g;
@@ -484,7 +495,10 @@ fn resources_body<'a>(
     // scroll in with immutable spline geometry (no re-fitting at reveal).
     let interval_ns = app.config.interval.as_nanos() as u64;
     let delay_ns = interval_ns.saturating_mul(2);
-    let window_end_ns = crate::clock_boottime_ns().saturating_sub(delay_ns);
+    let chart_now_ns = app
+        .chart_now_ns
+        .expect("published snapshots are installed only on display ticks");
+    let window_end_ns = chart_now_ns.saturating_sub(delay_ns);
 
     let gpu_expanded = snap
         .gpus
@@ -1057,7 +1071,24 @@ fn build_sections<'a>(
 
 /// Subscription function: 100ms display tick.
 pub fn subscription(_app: &Lightwatch) -> Subscription<Message> {
-    iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::SampleArrived)
+    iced::time::every(DISPLAY_INTERVAL).map(Message::DisplayTick)
+}
+
+/// Convert iced's scheduled display deadline into the sample clock domain.
+///
+/// This is anchored afresh on every tick: `Instant` excludes suspend on Linux,
+/// while `CLOCK_BOOTTIME` includes it. Subtracting only callback lateness keeps
+/// ordinary X steps even without erasing a real suspend-sized jump.
+fn chart_boottime_ns(deadline: Instant, now: Instant, boot_now_ns: u64) -> u64 {
+    if now >= deadline {
+        boot_now_ns.saturating_sub(duration_ns_u64(now.duration_since(deadline)))
+    } else {
+        boot_now_ns.saturating_add(duration_ns_u64(deadline.duration_since(now)))
+    }
+}
+
+fn duration_ns_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Theme function
@@ -1542,6 +1573,71 @@ fn legend_chip_fixed(label: &str, color: Color) -> Element<'static, Message> {
     .align_y(Alignment::Center)
     .width(Length::Fill)
     .into()
+}
+
+// ---------------------------------------------------------------------------
+// Display-clock tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod display_clock_tests {
+    use super::*;
+
+    const BOOT_BASE_NS: u64 = 1_000_000_000_000;
+
+    #[test]
+    fn scheduled_deadline_converts_on_time_late_and_early() {
+        let now = Instant::now();
+
+        assert_eq!(chart_boottime_ns(now, now, BOOT_BASE_NS), BOOT_BASE_NS);
+        assert_eq!(
+            chart_boottime_ns(now - Duration::from_millis(37), now, BOOT_BASE_NS,),
+            BOOT_BASE_NS - 37_000_000,
+        );
+        assert_eq!(
+            chart_boottime_ns(now + Duration::from_millis(25), now, BOOT_BASE_NS,),
+            BOOT_BASE_NS + 25_000_000,
+        );
+    }
+
+    #[test]
+    fn callback_lateness_does_not_change_regular_chart_steps() {
+        let first_deadline = Instant::now();
+        let first_now = first_deadline + Duration::from_millis(13);
+        let first = chart_boottime_ns(first_deadline, first_now, BOOT_BASE_NS + 13_000_000);
+
+        let second_deadline = first_deadline + DISPLAY_INTERVAL;
+        let second_now = second_deadline + Duration::from_millis(47);
+        let second = chart_boottime_ns(second_deadline, second_now, BOOT_BASE_NS + 147_000_000);
+
+        assert_eq!(second - first, 100_000_000);
+    }
+
+    #[test]
+    fn boottime_suspend_jump_is_preserved() {
+        let first_deadline = Instant::now();
+        let first_now = first_deadline + Duration::from_millis(10);
+        let first = chart_boottime_ns(first_deadline, first_now, BOOT_BASE_NS + 10_000_000);
+
+        let second_deadline = first_deadline + DISPLAY_INTERVAL;
+        let second_now = second_deadline + Duration::from_millis(10);
+        let second = chart_boottime_ns(second_deadline, second_now, BOOT_BASE_NS + 10_110_000_000);
+
+        assert_eq!(second - first, 10_100_000_000);
+    }
+
+    #[test]
+    fn skipped_deadlines_advance_once_by_the_full_gap() {
+        let first_deadline = Instant::now();
+        let first_now = first_deadline + Duration::from_millis(5);
+        let first = chart_boottime_ns(first_deadline, first_now, BOOT_BASE_NS + 5_000_000);
+
+        let next_deadline = first_deadline + Duration::from_millis(300);
+        let next_now = next_deadline + Duration::from_millis(40);
+        let next = chart_boottime_ns(next_deadline, next_now, BOOT_BASE_NS + 340_000_000);
+
+        assert_eq!(next - first, 300_000_000);
+    }
 }
 
 // ---------------------------------------------------------------------------

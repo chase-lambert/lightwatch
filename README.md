@@ -68,7 +68,7 @@ UI (iced)  ←── notify + pull latest Arc ──  Sampler thread
 |------|------|
 | Snapshots | Immutable each tick; process + health rows latest-only (no rings) |
 | History | Fixed rings; `capacity = floor(window/interval) + 6` ≤ **7206** |
-| Charts | Two-interval look-ahead; pixel-stable edges; gaps stay gaps |
+| Charts | Scheduled 100 ms display clock converted to `CLOCK_BOOTTIME`; two-interval look-ahead; pixel-stable edges; gaps stay gaps |
 | Handoff | Single-slot latest; never a queue |
 | Time | `CLOCK_BOOTTIME` sample stamps |
 | Scheduler | Deadline ticks; late → skip |
