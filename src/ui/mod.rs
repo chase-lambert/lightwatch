@@ -133,7 +133,16 @@ pub fn run_gui(config: HistoryConfig) -> iced::Result {
     .title(view::title)
     .subscription(view::subscription)
     .theme(view::theme)
-    .window_size((800.0, 900.0))
+    .window(iced::window::Settings {
+        size: iced::Size::new(800.0, 900.0),
+        platform_specific: iced::window::settings::PlatformSpecific {
+            // Must match the basename of lightwatch.desktop so Wayland shells
+            // group the running window with its pinned launcher.
+            application_id: "lightwatch".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
     .run()
 }
 
