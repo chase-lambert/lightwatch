@@ -49,7 +49,7 @@ Tabs: **Resources** (default) · **Processes** · **Health**.
 - **CPU** — overall %, temp, freq; multi-series per-core overlay (up to 256 cores; 16-color palette wraps)
 - **Memory / swap** — used/swap charts; Used, Avail, Swap, Load 1/5/15 chips (`used = MemTotal − MemAvailable`)
 - **GPUs** — by PCI BDF; AMD via sysfs; NVIDIA via NVML only when `runtime_status` is **active**
-- **Processes** — full userspace list (sort Memory ↓ by default). Name (exe basename + Electron `(type)`), % CPU as share of **total** machine capacity, Memory as **RssAnon**, disk read/write totals, ID. Search by name or pid prefix. **End Process** = SIGTERM after `pid+starttime` check; Chromium helpers walk to the app root first
+- **Processes** — full userspace list (sort Memory ↓ by default). Name (exe basename + Electron `(type)`), % CPU as share of **total** machine capacity, Memory as **RssAnon**, disk read/write totals, ID. Search by name or pid prefix. Single-click selects a row and arms the bottom **End Process** action; double-click opens a full-width live profile with CPU, private-memory, and block-I/O history; page-fault rates; PSS/private/swap/peak memory; and restrained process context. Profile history starts on drill-in, stays active across tabs until **Back**, and freezes when the process exits. **End Process** = SIGTERM after `pid+starttime` check; Chromium helpers walk to the app root first
 - **Health** — condition (not live load): block-backed mounts (used · available + fill bar); physical drive cards (model, kind, size, temp; NVMe wear when SMART is readable, silent otherwise); batteries (system first: charge % · health % · cycles; peripherals: name · %). No charging/AC status. Refreshed every 5 s
 - **Layout** — expanded Resource panels share height equally; GSM-style **▾ / ▸** disclosure; prefs in `$XDG_CONFIG_HOME/lightwatch/ui.conf` (or `~/.config/lightwatch/ui.conf`)
 
@@ -66,7 +66,7 @@ UI (iced)  ←── notify + pull latest Arc ──  Sampler thread
 
 | Idea | Rule |
 |------|------|
-| Snapshots | Immutable each tick; process + health rows latest-only (no rings) |
+| Snapshots | Immutable each tick; process rows + health latest-only; only the selected process owns bounded detail rings |
 | History | Fixed rings; `capacity = floor(window/interval) + 6` ≤ **7206** |
 | Charts | Canvas-local compositor redraw; GSM-style horizontal-tangent easing; two-interval look-ahead; pixel-stable edges; gaps stay gaps |
 | Handoff | Single-slot latest; never a queue |
@@ -77,9 +77,9 @@ UI (iced)  ←── notify + pull latest Arc ──  Sampler thread
 
 ```
 src/
-  model/     Snapshot, History, ProcessRow, HealthSnapshot, name helpers
+  model/     Snapshot, History, ProcessRow/Profile, HealthSnapshot, name helpers
   parse/     /proc parsers + mounts, power_supply, nvme_smart (pure, tested)
-  collect/   cpu, mem, self, proc, health, gpu/{amd,nvidia}
+  collect/   cpu, mem, self, process table/profile, health, gpu/{amd,nvidia}
   sample/    worker + latest
   ui/        tabs, prefs, sparklines
   diag.rs    --once / --soak
@@ -90,6 +90,10 @@ TEA UI; collectors stay UI-agnostic.
 ## Performance
 
 Bounded by design: one sampler thread, one Tokio worker by default, single-slot handoff, fixed history, 100 ms publication polling, and compositor-paced drawing only while expanded Resource charts exist. Rings linearize once per publication; cached axes and canonical curve paths do not rebuild per frame.
+
+Process profiling keeps the idle path lean: expensive procfs reads and six
+history rings exist only for the selected `(pid, starttime)`. Open-FD counting
+is capped at 4,096 entries per slow refresh.
 
 Pre-change baseline measured 2026-07-17 on Pop!_OS 24.04 COSMIC Wayland,
 **Ryzen 9 6900HS**, AMD 680M + RTX 3050 Mobile, release GUI after history

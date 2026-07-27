@@ -2,6 +2,7 @@ use super::latest::{Latest, Published};
 use crate::collect::gpu::{self, GpuDevice, amd, nvidia};
 use crate::collect::health::{HEALTH_REFRESH_NS, HealthCollector};
 use crate::collect::proc::ProcessCollector;
+use crate::collect::proc_profile::ProcessProfileCollector;
 use crate::collect::{cpu::CpuCollector, mem::MemCollector, self_metrics::SelfCollector};
 use crate::model::*;
 use core::time::Duration;
@@ -53,6 +54,8 @@ pub struct Sampler {
     mem_collector: MemCollector,
     self_collector: SelfCollector,
     process_collector: ProcessCollector,
+    process_profile_collector: ProcessProfileCollector,
+    selected_process: Arc<Mutex<Option<ProcessId>>>,
     health_collector: HealthCollector,
     history: History,
     gpu_devices: Vec<GpuDevice>,
@@ -75,6 +78,7 @@ impl Sampler {
         latest: Arc<Latest>,
         notify: SyncSender<()>,
         pending_config: Arc<Mutex<Option<HistoryConfig>>>,
+        selected_process: Arc<Mutex<Option<ProcessId>>>,
     ) -> Self {
         let core_ids = detect_core_ids();
         let (core_ids, _hidden) = normalize_core_ids(&core_ids);
@@ -87,6 +91,8 @@ impl Sampler {
             mem_collector: MemCollector::new("/proc"),
             self_collector: SelfCollector::new("/proc"),
             process_collector: ProcessCollector::new("/proc"),
+            process_profile_collector: ProcessProfileCollector::new("/proc"),
+            selected_process,
             health_collector: HealthCollector::new("/proc", "/sys", "/dev"),
             config,
             latest,
@@ -141,6 +147,13 @@ impl Sampler {
                     drop(guard);
                     match self.history.resize(new_config.capacity) {
                         Ok(()) => {
+                            if let Err(e) =
+                                self.process_profile_collector.resize(new_config.capacity)
+                            {
+                                eprintln!(
+                                    "sampler: profile config resize failed: {e} — keeping previous"
+                                );
+                            }
                             self.config = new_config;
                             interval_ns = self.config.interval.as_nanos();
                         }
@@ -179,6 +192,8 @@ impl Sampler {
                     self.cpu_collector.clear_baseline();
                     self.self_collector.clear_baseline();
                     self.process_collector.clear_baseline();
+                    self.process_profile_collector.push_gap(gap_t);
+                    self.process_profile_collector.clear_baseline();
                 }
             }
 
@@ -223,6 +238,26 @@ impl Sampler {
             let t_boot_ns = crate::clock_boottime_ns();
             // Process CPU% wall time uses the snapshot boottime stamp.
             let processes = self.process_collector.sample(t_boot_ns);
+            let profile_target = *self.selected_process.lock().unwrap();
+            let profile_name = profile_target.and_then(|id| {
+                processes
+                    .iter()
+                    .find(|row| row.id == id)
+                    .map(|row| row.name.as_str())
+            });
+            let profile_rss_anon_kb = profile_target.and_then(|id| {
+                processes
+                    .iter()
+                    .find(|row| row.id == id)
+                    .map(|row| row.mem_anon_kb)
+            });
+            let process_profile = self.process_profile_collector.sample(
+                profile_target,
+                profile_name,
+                profile_rss_anon_kb,
+                t_boot_ns,
+                self.config.capacity,
+            );
 
             // Health condition: refresh on a slower cadence; republish cache otherwise.
             if self.last_health_ns == 0
@@ -386,6 +421,7 @@ impl Sampler {
             let published = Arc::new(Published {
                 snapshot,
                 history: self.history.clone(),
+                process_profile,
             });
             self.latest.publish(published);
             let _ = self.notify.try_send(()); // ignore Full — consumer will pull latest anyway

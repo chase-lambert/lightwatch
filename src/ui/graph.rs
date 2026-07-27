@@ -28,6 +28,9 @@ pub enum ChartId {
     Cpu,
     Memory,
     Gpu(Arc<str>),
+    ProcessCpu,
+    ProcessMemory,
+    ProcessIo,
 }
 
 /// A generation-scoped series descriptor. Points are linearized once when the

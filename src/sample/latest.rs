@@ -9,6 +9,7 @@ use std::sync::{
 pub struct Published {
     pub snapshot: Snapshot,
     pub history: History,
+    pub process_profile: Option<PublishedProcessProfile>,
 }
 
 /// A single-slot cell for the latest published data.
@@ -106,6 +107,7 @@ mod tests {
                 health: crate::model::HealthSnapshot::default(),
             },
             history: History::new(&HistoryConfig::default_config(), &[], &[]),
+            process_profile: None,
         })
     }
 

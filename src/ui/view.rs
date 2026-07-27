@@ -134,12 +134,14 @@ pub struct Lightwatch {
     latest: Arc<Latest>,
     notify_rx: mpsc::Receiver<()>,
     pending_config: Arc<Mutex<Option<HistoryConfig>>>,
+    selected_process_control: Arc<Mutex<Option<ProcessId>>>,
     published: Option<Arc<Published>>,
     last_seen_gen: u64,
     /// Boottime-domain timestamp for chart motion, derived from the scheduled
     /// display deadline rather than callback delivery time.
     chart_now_ns: Option<u64>,
     chart_inputs: ChartInputs,
+    profile_chart_inputs: ProfileChartInputs,
     config: HistoryConfig,
     selected_preset: HistoryPreset,
     presets: Vec<HistoryPreset>,
@@ -150,7 +152,10 @@ pub struct Lightwatch {
     process_sort: ProcessSortKey,
     /// When true, larger values first for the active numeric column.
     process_sort_desc: bool,
+    /// The row selected in the process table by a single click.
     selected_process: Option<ProcessId>,
+    /// The process currently open in the double-click detail page.
+    profiled_process: Option<ProcessId>,
     /// Soft status under End Process (signal sent / denied / gone).
     process_status: Option<String>,
 }
@@ -172,6 +177,76 @@ struct ChartInputs {
     memory_content_signature: u64,
     memory_series: Vec<SeriesData>,
     gpu_series: Vec<GpuChartInputs>,
+}
+
+#[derive(Default)]
+struct ProfileChartInputs {
+    generation: u64,
+    cpu_signature: u64,
+    cpu: Vec<SeriesData>,
+    memory_signature: u64,
+    memory: Vec<SeriesData>,
+    io_signature: u64,
+    io: Vec<SeriesData>,
+}
+
+impl ProfileChartInputs {
+    fn from_published(generation: u64, published: &Published) -> Self {
+        let Some(profile) = &published.process_profile else {
+            return Self::default();
+        };
+        let history = &profile.history;
+        let cpu = vec![SeriesData {
+            points: Arc::from(history.cpu.points()),
+            color: theme::ACCENT_CPU,
+            max_value: 100.0,
+            fill: true,
+            line_alpha: None,
+        }];
+        let memory = vec![SeriesData {
+            points: Arc::from(history.rss_anon.points()),
+            color: theme::ACCENT_MEM,
+            max_value: series_max(&history.rss_anon).max(1.0),
+            fill: true,
+            line_alpha: None,
+        }];
+        let io_max = series_max(&history.disk_read)
+            .max(series_max(&history.disk_write))
+            .max(1.0);
+        let io = vec![
+            SeriesData {
+                points: Arc::from(history.disk_read.points()),
+                color: theme::ACCENT_CPU,
+                max_value: io_max,
+                fill: false,
+                line_alpha: None,
+            },
+            SeriesData {
+                points: Arc::from(history.disk_write.points()),
+                color: theme::ACCENT_SWAP,
+                max_value: io_max,
+                fill: false,
+                line_alpha: None,
+            },
+        ];
+        Self {
+            generation,
+            cpu_signature: chart_content_signature(&cpu, [0]),
+            memory_signature: chart_content_signature(&memory, [0]),
+            io_signature: chart_content_signature(&io, [0, 1]),
+            cpu,
+            memory,
+            io,
+        }
+    }
+}
+
+fn series_max(ring: &Ring) -> f32 {
+    ring.points()
+        .into_iter()
+        .filter_map(|point| point.value)
+        .fold(0.0, f32::max)
+        * 1.1
 }
 
 impl ChartInputs {
@@ -351,7 +426,9 @@ pub enum Message {
     ProcessQueryChanged(String),
     SortProcesses(ProcessSortKey),
     SelectProcess(ProcessId),
+    OpenProcessProfile(ProcessId),
     EndProcess,
+    BackToProcesses,
 }
 
 /// Boot function for the iced application.
@@ -359,13 +436,15 @@ pub fn boot(config: HistoryConfig) -> (Lightwatch, iced::Task<Message>) {
     let latest = Arc::new(Latest::new());
     let (notify_tx, notify_rx) = mpsc::sync_channel::<()>(1);
     let pending_config = Arc::new(Mutex::new(None::<HistoryConfig>));
+    let selected_process_control = Arc::new(Mutex::new(None::<ProcessId>));
 
     let s_latest = Arc::clone(&latest);
     let s_notify = notify_tx;
     let s_config = config.clone();
     let s_pending = Arc::clone(&pending_config);
+    let s_selected = Arc::clone(&selected_process_control);
     std::thread::spawn(move || {
-        let mut sampler = Sampler::new(s_config, s_latest, s_notify, s_pending);
+        let mut sampler = Sampler::new(s_config, s_latest, s_notify, s_pending, s_selected);
         sampler.run();
     });
 
@@ -381,10 +460,12 @@ pub fn boot(config: HistoryConfig) -> (Lightwatch, iced::Task<Message>) {
         latest,
         notify_rx,
         pending_config,
+        selected_process_control,
         published: None,
         last_seen_gen: 0,
         chart_now_ns: None,
         chart_inputs: ChartInputs::default(),
+        profile_chart_inputs: ProfileChartInputs::default(),
         config,
         selected_preset: initial_preset,
         presets: HistoryPreset::all(),
@@ -394,6 +475,7 @@ pub fn boot(config: HistoryConfig) -> (Lightwatch, iced::Task<Message>) {
         process_sort: ProcessSortKey::Memory,
         process_sort_desc: true,
         selected_process: None,
+        profiled_process: None,
         process_status: None,
     };
     (app, iced::Task::none())
@@ -416,20 +498,8 @@ pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
             while app.notify_rx.try_recv().is_ok() {}
             if let Some((g, pubd)) = app.latest.pull_if_newer(app.last_seen_gen) {
                 app.last_seen_gen = g;
-                // Clear selection if it is no longer in the *visible* table
-                // (left the set, filtered out, or fell outside the display cap).
-                if let Some(sel) = app.selected_process
-                    && !selection_is_visible(
-                        &pubd.snapshot.processes,
-                        &app.process_query,
-                        app.process_sort,
-                        app.process_sort_desc,
-                        sel,
-                    )
-                {
-                    app.selected_process = None;
-                }
                 app.chart_inputs = ChartInputs::from_published(g, &pubd);
+                app.profile_chart_inputs = ProfileChartInputs::from_published(g, &pubd);
                 app.published = Some(pubd);
             }
             iced::Task::none()
@@ -457,7 +527,6 @@ pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
         }
         Message::ProcessQueryChanged(q) => {
             app.process_query = q;
-            clear_selection_if_not_visible(app);
             iced::Task::none()
         }
         Message::SortProcesses(key) => {
@@ -469,7 +538,6 @@ pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
                 // Name/PID start ascending (dictionary / id order).
                 app.process_sort_desc = !matches!(key, ProcessSortKey::Name | ProcessSortKey::Pid);
             }
-            clear_selection_if_not_visible(app);
             iced::Task::none()
         }
         Message::SelectProcess(id) => {
@@ -477,24 +545,42 @@ pub fn update(app: &mut Lightwatch, message: Message) -> iced::Task<Message> {
             app.process_status = None;
             iced::Task::none()
         }
+        Message::OpenProcessProfile(id) => {
+            app.selected_process = Some(id);
+            set_profile_target(
+                &mut app.profiled_process,
+                &app.selected_process_control,
+                Some(id),
+            );
+            app.process_status = None;
+            iced::Task::none()
+        }
         Message::EndProcess => {
-            if let Some(id) = app.selected_process {
+            if let Some(id) = app.profiled_process.or(app.selected_process) {
                 let outcome = proc_collect::end_process(Path::new("/proc"), id);
                 app.process_status = Some(kill_status_text(&outcome));
-                // Clear selection when gone/mismatched, or after a successful
-                // root redirect (the helper may linger briefly as a zombie view).
-                if matches!(
-                    outcome,
-                    KillOutcome::Gone
-                        | KillOutcome::IdentityMismatch
-                        | KillOutcome::SignalSentToRoot { .. }
-                ) {
-                    app.selected_process = None;
-                }
             }
             iced::Task::none()
         }
+        Message::BackToProcesses => {
+            set_profile_target(
+                &mut app.profiled_process,
+                &app.selected_process_control,
+                None,
+            );
+            app.process_status = None;
+            iced::Task::none()
+        }
     }
+}
+
+fn set_profile_target(
+    profiled: &mut Option<ProcessId>,
+    control: &Mutex<Option<ProcessId>>,
+    next: Option<ProcessId>,
+) {
+    *profiled = next;
+    *control.lock().unwrap() = next;
 }
 
 fn kill_status_text(outcome: &KillOutcome) -> String {
@@ -507,27 +593,6 @@ fn kill_status_text(outcome: &KillOutcome) -> String {
         KillOutcome::IdentityMismatch => "process identity changed — not signalled".into(),
         KillOutcome::PermissionDenied => "permission denied".into(),
         KillOutcome::Failed(s) => format!("failed: {s}"),
-    }
-}
-
-/// Drop selection when it is not in the current visible slice (auth boundary
-/// for End Process is the highlighted visible row).
-fn clear_selection_if_not_visible(app: &mut Lightwatch) {
-    let Some(sel) = app.selected_process else {
-        return;
-    };
-    let Some(pubd) = app.published.as_ref() else {
-        app.selected_process = None;
-        return;
-    };
-    if !selection_is_visible(
-        &pubd.snapshot.processes,
-        &app.process_query,
-        app.process_sort,
-        app.process_sort_desc,
-        sel,
-    ) {
-        app.selected_process = None;
     }
 }
 
@@ -575,14 +640,18 @@ fn tab_chrome<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Messag
     let trailing: Element<'a, Message> = match app.active_tab {
         AppTab::Resources => history_presets(app),
         AppTab::Processes => {
-            let match_count = visible_processes(
-                &snap.processes,
-                &app.process_query,
-                app.process_sort,
-                app.process_sort_desc,
-            )
-            .match_count;
-            process_search_trailing(app, match_count)
+            if app.profiled_process.is_some() {
+                Space::new().width(Length::Shrink).into()
+            } else {
+                let match_count = visible_processes(
+                    &snap.processes,
+                    &app.process_query,
+                    app.process_sort,
+                    app.process_sort_desc,
+                )
+                .match_count;
+                process_search_trailing(app, match_count)
+            }
         }
         AppTab::Health => Space::new().width(Length::Shrink).into(),
     };
@@ -982,6 +1051,31 @@ const COL_DWRITE: u16 = 16;
 const COL_PID: u16 = 14;
 
 fn processes_body<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Message> {
+    if let Some(profiled) = app.profiled_process {
+        return match app
+            .published
+            .as_ref()
+            .and_then(|published| published.process_profile.as_ref())
+            .filter(|profile| profile.snapshot.id == profiled)
+        {
+            Some(profile) => process_profile_body(app, profile),
+            None => {
+                let message = if snap.processes.iter().any(|row| row.id == profiled) {
+                    "Loading process profile…"
+                } else {
+                    "Process ended before its first profile sample."
+                };
+                column![
+                    button("← Back").on_press(Message::BackToProcesses),
+                    Space::new().height(24),
+                    text(message).size(14).color(theme::TEXT_DIM)
+                ]
+                .spacing(8)
+                .into()
+            }
+        };
+    }
+
     let visible = visible_processes(
         &snap.processes,
         &app.process_query,
@@ -996,55 +1090,379 @@ fn processes_body<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Me
     let body_rows: Vec<Element<Message>> = visible
         .rows
         .iter()
-        .map(|r| process_row(r, selected == Some(r.id)))
+        .map(|row| process_row(row, selected == Some(row.id)))
         .collect();
 
     let list = scrollable(column(body_rows).spacing(1).width(Length::Fill))
         .height(Length::Fill)
         .width(Length::Fill);
 
-    let end_btn = {
-        let label = text("End Process").size(12);
-        let mut btn = button(label).padding([6, 12]);
-        // Only arm when selection is currently visible (re-checked each frame).
-        let armed = app
-            .selected_process
-            .is_some_and(|sel| visible.rows.iter().any(|r| r.id == sel));
-        if armed {
-            btn = btn
-                .style(iced::widget::button::danger)
-                .on_press(Message::EndProcess);
-        }
-        btn
-    };
-
-    let status = text(app.process_status.clone().unwrap_or_else(|| {
-        if let Some(sel) = app.selected_process {
-            if let Some(r) = visible.rows.iter().find(|r| r.id == sel) {
+    let selected_row = selected.and_then(|id| visible.rows.iter().find(|row| row.id == id));
+    let mut end = button(text("End Process").size(12)).padding([6, 12]);
+    if selected_row.is_some() {
+        end = end
+            .style(iced::widget::button::danger)
+            .on_press(Message::EndProcess);
+    }
+    let status = app.process_status.clone().unwrap_or_else(|| {
+        selected_row.map_or_else(
+            || "Select a process · double-click to inspect".into(),
+            |row| {
                 format!(
-                    "selected {} ({}) — End Process sends SIGTERM",
-                    r.name, r.id.pid
+                    "{} ({}) selected · double-click to inspect",
+                    row.name, row.id.pid
                 )
-            } else {
-                "select a process".into()
-            }
-        } else {
-            "select a process".into()
-        }
-    }))
-    .size(11)
-    .color(theme::TEXT_DIM);
-
-    let footer = row![end_btn, Space::new().width(12), status]
-        .spacing(4)
-        .align_y(Alignment::Center)
-        .padding([4, 2]);
+            },
+        )
+    });
+    let footer = row![
+        end,
+        Space::new().width(12),
+        text(status).size(11).color(theme::TEXT_DIM)
+    ]
+    .align_y(Alignment::Center)
+    .padding([4, 2]);
 
     column![headers, list, footer]
         .spacing(4)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+fn process_profile_body<'a>(
+    app: &'a Lightwatch,
+    profile: &'a PublishedProcessProfile,
+) -> Element<'a, Message> {
+    let snapshot = &profile.snapshot;
+    let alive = snapshot.alive;
+    let status_color = if alive {
+        theme::ACCENT_GPU
+    } else {
+        theme::ACCENT_WARN
+    };
+    let mut end = button(text("End Process").size(12))
+        .style(iced::widget::button::danger)
+        .padding([6, 12]);
+    if alive {
+        end = end.on_press(Message::EndProcess);
+    }
+    let header = row![
+        button("← Back")
+            .style(iced::widget::button::text)
+            .on_press(Message::BackToProcesses),
+        text(snapshot.name.as_str()).size(20).color(theme::TEXT),
+        text(if alive { "LIVE" } else { "ENDED" })
+            .size(10)
+            .color(status_color),
+        Space::new().width(Length::Fill),
+        text(format!("PID {}", snapshot.id.pid))
+            .size(12)
+            .color(theme::TEXT_DIM),
+        end,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+
+    let uid = rfmt(&snapshot.uid, |value| format!("UID {value}"));
+    let summary = row![
+        profile_stat("State", process_state(snapshot.state)),
+        profile_stat("Age", format_duration(snapshot.age_secs)),
+        profile_stat("Threads", snapshot.thread_count.to_string()),
+        profile_stat("Parent", snapshot.parent_pid.to_string()),
+        profile_stat("User", uid),
+        profile_stat("CPU priority", nice_label(snapshot.nice)),
+    ]
+    .spacing(8);
+
+    let chart_window = profile_chart_window(app);
+    let cpu = rfmt(&snapshot.cpu_percent, |value| format!("{value:.1}%"));
+    let cpu_time = format!(
+        "{} user · {} system",
+        format_duration(snapshot.user_cpu_secs as u64),
+        format_duration(snapshot.system_cpu_secs as u64)
+    );
+    let faults = format!(
+        "{} minor/s · {} major/s",
+        rfmt(&snapshot.minor_faults_per_sec, |value| format!(
+            "{value:.1}"
+        )),
+        rfmt(&snapshot.major_faults_per_sec, |value| format!(
+            "{value:.1}"
+        ))
+    );
+    let cpu_card = profile_card(
+        "CPU",
+        row![
+            text(cpu).size(16).color(theme::ACCENT_CPU),
+            text(cpu_time).size(11).color(theme::TEXT_DIM),
+            Space::new().width(Length::Fill),
+            text(faults).size(11).color(theme::TEXT_DIM),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .into(),
+        profile_chart(
+            ChartId::ProcessCpu,
+            app.profile_chart_inputs.generation,
+            app.profile_chart_inputs.cpu_signature,
+            &app.profile_chart_inputs.cpu,
+            chart_window.clone(),
+            alive,
+        ),
+    );
+
+    let memory_primary = bytes_to_human(snapshot.rss_anon_kb.saturating_mul(1024));
+    let memory_detail = format!(
+        "PSS {} · Private {} · RSS {} · Peak {} · Swap {}",
+        reading_bytes(&snapshot.pss_kb),
+        reading_bytes(&snapshot.private_kb),
+        reading_bytes(&snapshot.rss_total_kb),
+        reading_bytes(&snapshot.rss_peak_kb),
+        reading_bytes(&snapshot.swap_kb),
+    );
+    let memory_card = profile_card(
+        "Memory",
+        row![
+            text(format!("{memory_primary} RssAnon"))
+                .size(16)
+                .color(theme::ACCENT_MEM),
+            Space::new().width(Length::Fill),
+            text(memory_detail).size(11).color(theme::TEXT_DIM),
+        ]
+        .align_y(Alignment::Center)
+        .into(),
+        profile_chart(
+            ChartId::ProcessMemory,
+            app.profile_chart_inputs.generation,
+            app.profile_chart_inputs.memory_signature,
+            &app.profile_chart_inputs.memory,
+            chart_window.clone(),
+            false,
+        ),
+    );
+
+    let read_rate = reading_rate(&snapshot.disk_read_bytes_per_sec);
+    let write_rate = reading_rate(&snapshot.disk_write_bytes_per_sec);
+    let io_card = profile_card(
+        "Disk I/O",
+        row![
+            text(format!("Read {read_rate}"))
+                .size(14)
+                .color(theme::ACCENT_CPU),
+            text(format!("Write {write_rate}"))
+                .size(14)
+                .color(theme::ACCENT_SWAP),
+            Space::new().width(Length::Fill),
+            text(format!(
+                "Totals {} read · {} written",
+                reading_bytes_raw(&snapshot.disk_read_bytes),
+                reading_bytes_raw(&snapshot.disk_write_bytes)
+            ))
+            .size(11)
+            .color(theme::TEXT_DIM),
+        ]
+        .spacing(14)
+        .align_y(Alignment::Center)
+        .into(),
+        profile_chart(
+            ChartId::ProcessIo,
+            app.profile_chart_inputs.generation,
+            app.profile_chart_inputs.io_signature,
+            &app.profile_chart_inputs.io,
+            chart_window,
+            false,
+        ),
+    );
+
+    let fd_text = match snapshot.open_fds {
+        Reading::Value(value) if value.capped => format!("≥{} open files", value.count),
+        Reading::Value(value) => format!("{} open files", value.count),
+        Reading::Unavailable { .. } => "open files unavailable".into(),
+    };
+    let more = container(
+        column![
+            text("More").size(13).color(theme::TEXT),
+            text(format!(
+                "CPUs {} · {fd_text}",
+                rfmt(&snapshot.cpu_affinity, Clone::clone),
+            ))
+            .size(11)
+            .color(theme::TEXT_DIM),
+            text(format!(
+                "Executable  {}",
+                truncate_reading(&snapshot.executable, 120)
+            ))
+            .size(11)
+            .color(theme::TEXT_DIM),
+            text(format!(
+                "Command  {}",
+                truncate_reading(&snapshot.command_line, 140)
+            ))
+            .size(11)
+            .color(theme::TEXT_DIM),
+            text(format!(
+                "Cgroup  {}",
+                truncate_reading(&snapshot.cgroup, 140)
+            ))
+            .size(11)
+            .color(theme::TEXT_DIM),
+        ]
+        .spacing(5),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(profile_card_style);
+
+    let signal_status: Element<'_, Message> = app
+        .process_status
+        .as_ref()
+        .map(|value| text(value).size(11).color(theme::TEXT_DIM).into())
+        .unwrap_or_else(|| Space::new().height(0).into());
+
+    scrollable(
+        column![
+            header,
+            summary,
+            signal_status,
+            cpu_card,
+            memory_card,
+            io_card,
+            more
+        ]
+        .spacing(8)
+        .width(Length::Fill),
+    )
+    .height(Length::Fill)
+    .into()
+}
+
+fn process_state(state: char) -> String {
+    match state {
+        'R' => "Running",
+        'S' => "Waiting",
+        'D' => "I/O wait",
+        'T' | 't' => "Stopped",
+        'Z' => "Zombie",
+        'I' => "Idle",
+        _ => "Other",
+    }
+    .into()
+}
+
+fn nice_label(nice: i64) -> String {
+    match nice.cmp(&0) {
+        std::cmp::Ordering::Less => format!("Higher ({nice})"),
+        std::cmp::Ordering::Equal => "Normal (0)".into(),
+        std::cmp::Ordering::Greater => format!("Lower (+{nice})"),
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn profile_stat(label: &'static str, value: String) -> Element<'static, Message> {
+    container(
+        column![
+            text(label).size(10).color(theme::TEXT_DIM),
+            text(value).size(12).color(theme::TEXT)
+        ]
+        .spacing(2),
+    )
+    .padding([5, 8])
+    .style(profile_card_style)
+    .into()
+}
+
+fn profile_card<'a>(
+    title: &'static str,
+    summary: Element<'a, Message>,
+    chart: Element<'a, Message>,
+) -> Element<'a, Message> {
+    container(
+        column![text(title).size(13).color(theme::TEXT), summary, chart]
+            .spacing(6)
+            .width(Length::Fill),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(profile_card_style)
+    .into()
+}
+
+fn profile_card_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(theme::SURFACE)),
+        border: iced::Border {
+            color: theme::BORDER,
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+fn profile_chart<'a>(
+    id: ChartId,
+    generation: u64,
+    signature: u64,
+    series: &'a [SeriesData],
+    window: DrawWindow,
+    animate: bool,
+) -> Element<'a, Message> {
+    let mut chart = MultiChart::new(id, generation, signature, series, true);
+    chart.window = window;
+    chart.animate = animate;
+    Canvas::new(chart)
+        .width(Length::Fill)
+        .height(Length::Fixed(110.0))
+        .into()
+}
+
+fn profile_chart_window(app: &Lightwatch) -> DrawWindow {
+    let interval_ns = app.config.interval.as_nanos() as u64;
+    DrawWindow {
+        sample_interval_ns: interval_ns,
+        window_secs: app.config.window.as_secs_f64(),
+        window_end_ns: app
+            .chart_now_ns
+            .unwrap_or_else(crate::clock_boottime_ns)
+            .saturating_sub(interval_ns.saturating_mul(2)),
+    }
+}
+
+fn reading_bytes(value: &Reading<u64>) -> String {
+    rfmt(value, |value| bytes_to_human(value.saturating_mul(1024)))
+}
+
+fn reading_bytes_raw(value: &Reading<u64>) -> String {
+    rfmt(value, |value| bytes_to_human(*value))
+}
+
+fn reading_rate(value: &Reading<f32>) -> String {
+    rfmt(value, |value| {
+        format!("{}/s", bytes_to_human(*value as u64))
+    })
+}
+
+fn truncate_reading(value: &Reading<String>, max: usize) -> String {
+    rfmt(value, |value| {
+        if value.chars().count() <= max {
+            value.clone()
+        } else {
+            value.chars().take(max - 1).collect::<String>() + "…"
+        }
+    })
 }
 
 fn sort_marker(active: bool, desc: bool) -> &'static str {
@@ -1127,37 +1545,36 @@ fn process_row(row: &ProcessRow, selected: bool) -> Element<'static, Message> {
         n
     };
 
-    let fg = if selected { Color::WHITE } else { theme::TEXT };
-    let dim = if selected {
+    let foreground = if selected { Color::WHITE } else { theme::TEXT };
+    let secondary = if selected {
         Color::WHITE
     } else {
         theme::TEXT_DIM
     };
-
     let cells = row![
         text(name)
             .size(12)
-            .color(fg)
+            .color(foreground)
             .width(Length::FillPortion(COL_NAME)),
         text(cpu)
             .size(12)
-            .color(fg)
+            .color(foreground)
             .width(Length::FillPortion(COL_CPU)),
         text(mem)
             .size(12)
-            .color(fg)
+            .color(foreground)
             .width(Length::FillPortion(COL_MEM)),
         text(dread)
             .size(12)
-            .color(dim)
+            .color(secondary)
             .width(Length::FillPortion(COL_DREAD)),
         text(dwrite)
             .size(12)
-            .color(dim)
+            .color(secondary)
             .width(Length::FillPortion(COL_DWRITE)),
         text(row.id.pid.to_string())
             .size(12)
-            .color(dim)
+            .color(secondary)
             .width(Length::FillPortion(COL_PID)),
     ]
     .spacing(2)
@@ -1165,18 +1582,17 @@ fn process_row(row: &ProcessRow, selected: bool) -> Element<'static, Message> {
     .width(Length::Fill)
     .padding([3, 4]);
 
-    let bg = if selected {
+    let background = if selected {
         theme::with_alpha(theme::ACCENT_CPU, 0.35)
     } else {
         Color::TRANSPARENT
     };
-
     let id = row.id;
     mouse_area(
         container(cells)
             .width(Length::Fill)
-            .style(move |_t| container::Style {
-                background: Some(iced::Background::Color(bg)),
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(background)),
                 border: iced::Border {
                     radius: 2.0.into(),
                     ..Default::default()
@@ -1185,6 +1601,7 @@ fn process_row(row: &ProcessRow, selected: bool) -> Element<'static, Message> {
             }),
     )
     .on_press(Message::SelectProcess(id))
+    .on_double_click(Message::OpenProcessProfile(id))
     .into()
 }
 
@@ -1731,6 +2148,44 @@ fn legend_chip_fixed<'a>(label: &'a str, color: Color) -> Element<'a, Message> {
 // ---------------------------------------------------------------------------
 // Display-clock tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod process_selection_tests {
+    use super::*;
+
+    #[test]
+    fn profile_control_is_sticky_replaceable_and_clearable() {
+        let first = ProcessId {
+            pid: 10,
+            starttime: 100,
+        };
+        let second = ProcessId {
+            pid: 11,
+            starttime: 200,
+        };
+        let control = Mutex::new(None);
+        let mut profiled = None;
+
+        set_profile_target(&mut profiled, &control, Some(first));
+        assert_eq!(profiled, Some(first));
+        assert_eq!(*control.lock().unwrap(), Some(first));
+
+        set_profile_target(&mut profiled, &control, Some(second));
+        assert_eq!(profiled, Some(second));
+        assert_eq!(*control.lock().unwrap(), Some(second));
+
+        set_profile_target(&mut profiled, &control, None);
+        assert_eq!(profiled, None);
+        assert_eq!(*control.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn nice_labels_explain_relative_cpu_priority() {
+        assert_eq!(nice_label(-5), "Higher (-5)");
+        assert_eq!(nice_label(0), "Normal (0)");
+        assert_eq!(nice_label(10), "Lower (+10)");
+    }
+}
 
 #[cfg(test)]
 mod display_clock_tests {

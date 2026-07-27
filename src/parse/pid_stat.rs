@@ -9,10 +9,16 @@
 pub struct PidStat {
     pub pid: u32,
     pub comm: String,
+    pub state: char,
     /// Parent pid (`stat` field 4).
     pub ppid: u32,
+    pub minor_faults: u64,
+    pub major_faults: u64,
     pub utime: u64,
     pub stime: u64,
+    pub priority: i64,
+    pub nice: i64,
+    pub num_threads: u32,
     /// Clock ticks since boot at process start (`stat` field 22). Stable
     /// identity together with `pid` across PID reuse.
     pub starttime: u64,
@@ -55,7 +61,9 @@ pub fn parse_pid_stat(content: &str) -> Result<PidStat, ParsePidStatError> {
     let comm = content[open + 1..close].to_string();
 
     // After ") ": state ppid ... (field 3 onward in man page).
-    let after = content.get(close + 1..).ok_or(ParsePidStatError::BadFormat)?;
+    let after = content
+        .get(close + 1..)
+        .ok_or(ParsePidStatError::BadFormat)?;
     let after = after.trim_start();
     let fields: Vec<&str> = after.split_whitespace().collect();
     // Need indices 1 (ppid), 11 (utime), 12 (stime), 19 (starttime) after comm.
@@ -63,13 +71,32 @@ pub fn parse_pid_stat(content: &str) -> Result<PidStat, ParsePidStatError> {
         return Err(ParsePidStatError::BadFormat);
     }
 
+    let state = fields[0]
+        .chars()
+        .next()
+        .ok_or(ParsePidStatError::BadFormat)?;
     let ppid = fields[1]
+        .parse()
+        .map_err(|_| ParsePidStatError::NotANumber)?;
+    let minor_faults = fields[7]
+        .parse()
+        .map_err(|_| ParsePidStatError::NotANumber)?;
+    let major_faults = fields[9]
         .parse()
         .map_err(|_| ParsePidStatError::NotANumber)?;
     let utime = fields[11]
         .parse()
         .map_err(|_| ParsePidStatError::NotANumber)?;
     let stime = fields[12]
+        .parse()
+        .map_err(|_| ParsePidStatError::NotANumber)?;
+    let priority = fields[15]
+        .parse()
+        .map_err(|_| ParsePidStatError::NotANumber)?;
+    let nice = fields[16]
+        .parse()
+        .map_err(|_| ParsePidStatError::NotANumber)?;
+    let num_threads = fields[17]
         .parse()
         .map_err(|_| ParsePidStatError::NotANumber)?;
     let starttime = fields[19]
@@ -79,9 +106,15 @@ pub fn parse_pid_stat(content: &str) -> Result<PidStat, ParsePidStatError> {
     Ok(PidStat {
         pid,
         comm,
+        state,
         ppid,
+        minor_faults,
+        major_faults,
         utime,
         stime,
+        priority,
+        nice,
+        num_threads,
         starttime,
     })
 }
@@ -104,9 +137,15 @@ mod tests {
         let s = parse_pid_stat(sample_stat()).unwrap();
         assert_eq!(s.pid, 12345);
         assert_eq!(s.comm, "lightwatch");
+        assert_eq!(s.state, 'S');
         assert_eq!(s.ppid, 1234);
+        assert_eq!(s.minor_faults, 123);
+        assert_eq!(s.major_faults, 0);
         assert_eq!(s.utime, 150);
         assert_eq!(s.stime, 25);
+        assert_eq!(s.priority, 20);
+        assert_eq!(s.nice, 0);
+        assert_eq!(s.num_threads, 8);
         assert_eq!(s.starttime, 999888);
     }
 

@@ -196,7 +196,7 @@ impl ProcessCollector {
     }
 }
 
-fn clock_ticks_per_sec() -> u64 {
+pub(crate) fn clock_ticks_per_sec() -> u64 {
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if ticks > 0 {
         ticks as u64
@@ -206,7 +206,7 @@ fn clock_ticks_per_sec() -> u64 {
 }
 
 /// Online logical CPUs for total-capacity CPU% (at least 1).
-fn online_logical_cpus() -> u32 {
+pub(crate) fn online_logical_cpus() -> u32 {
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if n > 0 {
         n as u32
