@@ -28,18 +28,19 @@ struct GpuEnvBundle {
 /// has not set any of `WGPU_POWER_PREF`, `VK_ICD_FILENAMES`, or
 /// `WGPU_BACKEND`.
 ///
-/// - All three vars set to `None` (truly absent) AND radeon ICD file exists →
-///   propose `WGPU_POWER_PREF=low` + `VK_ICD_FILENAMES=<radeon path>` +
-///   `WGPU_BACKEND=vulkan`.
+/// - All three vars set to `None` (truly absent), AMD hardware exists, and the
+///   Radeon ICD exists → propose the complete Radeon Vulkan bundle.
 /// - Any managed var is `Some(_)` (including non-Unicode) → propose nothing;
 ///   the user is managing GPU selection.
-/// - All absent but radeon ICD missing → propose only `WGPU_POWER_PREF=low`.
+/// - All absent but AMD hardware or the Radeon ICD is missing → propose only
+///   `WGPU_POWER_PREF=low`.
 ///
 /// This function is pure (no environment mutation) and testable.
 fn propose_gpu_env(
     power_pref: Option<&OsStr>,
     vk_icd: Option<&OsStr>,
     backend: Option<&OsStr>,
+    amd_hardware_present: bool,
     radeon_icd_exists: bool,
 ) -> GpuEnvBundle {
     // If the user has set any managed var, the default bundle is disabled
@@ -51,14 +52,15 @@ fn propose_gpu_env(
             backend: None,
         };
     }
+    let use_radeon_vulkan = amd_hardware_present && radeon_icd_exists;
     GpuEnvBundle {
         power_pref: Some("low"),
-        vk_icd_filenames: if radeon_icd_exists {
+        vk_icd_filenames: if use_radeon_vulkan {
             Some(RADEON_ICD_PATH)
         } else {
             None
         },
-        backend: radeon_icd_exists.then_some("vulkan"),
+        backend: use_radeon_vulkan.then_some("vulkan"),
     }
 }
 
@@ -78,10 +80,14 @@ fn propose_tokio_worker_threads(current: Option<&OsStr>) -> Option<&'static str>
 /// no concurrent env access and the unsafety is contained to this boundary.
 fn apply_gpu_env() {
     let radeon_exists = Path::new(RADEON_ICD_PATH).exists();
+    let amd_hardware_present = crate::collect::gpu::discover("/sys")
+        .iter()
+        .any(|device| device.vendor_id == "1002" || device.driver == "amdgpu");
     let bundle = propose_gpu_env(
         std::env::var_os("WGPU_POWER_PREF").as_deref(),
         std::env::var_os("VK_ICD_FILENAMES").as_deref(),
         std::env::var_os("WGPU_BACKEND").as_deref(),
+        amd_hardware_present,
         radeon_exists,
     );
     if let Some(v) = bundle.power_pref {
@@ -162,7 +168,7 @@ mod tests {
 
     #[test]
     fn all_unset_icd_exists_proposes_full_bundle() {
-        let b = propose_gpu_env(None, None, None, true);
+        let b = propose_gpu_env(None, None, None, true, true);
         assert_eq!(b.power_pref, Some("low"));
         assert_eq!(b.vk_icd_filenames, Some(RADEON_ICD_PATH));
         assert_eq!(b.backend, Some("vulkan"));
@@ -170,7 +176,15 @@ mod tests {
 
     #[test]
     fn all_unset_icd_missing_proposes_power_pref_only() {
-        let b = propose_gpu_env(None, None, None, false);
+        let b = propose_gpu_env(None, None, None, true, false);
+        assert_eq!(b.power_pref, Some("low"));
+        assert_eq!(b.vk_icd_filenames, None);
+        assert_eq!(b.backend, None);
+    }
+
+    #[test]
+    fn all_unset_without_amd_hardware_does_not_pin_radeon() {
+        let b = propose_gpu_env(None, None, None, false, true);
         assert_eq!(b.power_pref, Some("low"));
         assert_eq!(b.vk_icd_filenames, None);
         assert_eq!(b.backend, None);
@@ -181,7 +195,7 @@ mod tests {
         vk_icd: Option<&OsStr>,
         backend: Option<&OsStr>,
     ) {
-        let b = propose_gpu_env(power_pref, vk_icd, backend, true);
+        let b = propose_gpu_env(power_pref, vk_icd, backend, true, true);
         assert_eq!(
             b,
             GpuEnvBundle {

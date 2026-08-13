@@ -1,8 +1,6 @@
 //! Process table collector — scan `/proc`, CPU deltas, userspace rows.
 
-use crate::model::{
-    ProcessId, ProcessRow, Reading, display_name, is_helper_cmdline,
-};
+use crate::model::{ProcessId, ProcessRow, Reading, display_name, is_helper_cmdline};
 use crate::parse::{parse_pid_io, parse_pid_stat, parse_self_status};
 use std::collections::HashMap;
 use std::fs;
@@ -174,16 +172,10 @@ impl ProcessCollector {
         // cmdline: Electron --type= + argv0 basename when exe is unavailable.
         // exe basename beats truncated `comm` (15-char kernel limit).
         let cmdline = fs::read(dir.join("cmdline")).unwrap_or_default();
-        let exe_base = fs::read_link(dir.join("exe")).ok().and_then(|p| {
-            p.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-        });
-        let name = display_name(
-            &stat.comm,
-            &cmdline,
-            exe_base.as_deref(),
-            pid,
-        );
+        let exe_base = fs::read_link(dir.join("exe"))
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()));
+        let name = display_name(&stat.comm, &cmdline, exe_base.as_deref(), pid);
 
         Some(ProcessRow {
             id,
@@ -198,33 +190,20 @@ impl ProcessCollector {
 
 pub(crate) fn clock_ticks_per_sec() -> u64 {
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks > 0 {
-        ticks as u64
-    } else {
-        100
-    }
+    if ticks > 0 { ticks as u64 } else { 100 }
 }
 
 /// Online logical CPUs for total-capacity CPU% (at least 1).
 pub(crate) fn online_logical_cpus() -> u32 {
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if n > 0 {
-        n as u32
-    } else {
-        1
-    }
+    if n > 0 { n as u32 } else { 1 }
 }
 
 /// Process CPU as a percentage of **total** machine capacity.
 ///
 /// `tick_delta` is utime+stime delta; `wall_ns` is wall time between samples;
 /// `n_cpus` is online logical CPUs. One core fully busy → `100 / n_cpus`.
-pub fn cpu_percent_of_machine(
-    tick_delta: u64,
-    wall_ns: u64,
-    clk_tck: u64,
-    n_cpus: u32,
-) -> f32 {
+pub fn cpu_percent_of_machine(tick_delta: u64, wall_ns: u64, clk_tck: u64, n_cpus: u32) -> f32 {
     if wall_ns == 0 || clk_tck == 0 || n_cpus == 0 {
         return 0.0;
     }
@@ -242,7 +221,9 @@ pub fn cpu_percent_of_machine(
 pub enum KillOutcome {
     SignalSent,
     /// Helper was selected; SIGTERM went to the resolved app-root pid.
-    SignalSentToRoot { root_pid: u32 },
+    SignalSentToRoot {
+        root_pid: u32,
+    },
     Gone,
     IdentityMismatch,
     PermissionDenied,
@@ -288,14 +269,14 @@ pub fn end_process(proc_root: &Path, id: ProcessId) -> KillOutcome {
     let rc = unsafe { libc::kill(target.pid as i32, libc::SIGTERM) };
     if rc == 0 {
         if target != id {
-            KillOutcome::SignalSentToRoot { root_pid: target.pid }
+            KillOutcome::SignalSentToRoot {
+                root_pid: target.pid,
+            }
         } else {
             KillOutcome::SignalSent
         }
     } else {
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(0);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         classify_kill_result(rc, errno)
     }
 }
@@ -316,37 +297,44 @@ fn identity_matches(proc_root: &Path, id: ProcessId) -> bool {
 /// Bounded walk; fails closed to the original id if the chain breaks.
 pub fn resolve_end_target(proc_root: &Path, id: ProcessId) -> ProcessId {
     let mut current = id;
+    let mut visited = std::collections::HashSet::from([id]);
     for _ in 0..32 {
         let dir = proc_root.join(current.pid.to_string());
-        let cmdline = fs::read(dir.join("cmdline")).unwrap_or_default();
+        let stat = match fs::read_to_string(dir.join("stat"))
+            .ok()
+            .and_then(|content| parse_pid_stat(&content).ok())
+        {
+            Some(stat) if stat.pid == current.pid && stat.starttime == current.starttime => stat,
+            _ => return id,
+        };
+        let cmdline = match fs::read(dir.join("cmdline")) {
+            Ok(cmdline) if !cmdline.is_empty() => cmdline,
+            _ => return id,
+        };
         if !is_helper_cmdline(&cmdline) {
             return current;
         }
-        let content = match fs::read_to_string(dir.join("stat")) {
-            Ok(c) => c,
-            Err(_) => return current,
-        };
-        let stat = match parse_pid_stat(&content) {
-            Ok(s) => s,
-            Err(_) => return current,
-        };
         if stat.ppid <= 1 {
-            return current;
+            return id;
         }
         let parent_dir = proc_root.join(stat.ppid.to_string());
         let parent_stat = match fs::read_to_string(parent_dir.join("stat")) {
             Ok(c) => match parse_pid_stat(&c) {
                 Ok(s) => s,
-                Err(_) => return current,
+                Err(_) => return id,
             },
-            Err(_) => return current,
+            Err(_) => return id,
         };
-        current = ProcessId {
+        let parent = ProcessId {
             pid: parent_stat.pid,
             starttime: parent_stat.starttime,
         };
+        if parent.pid != stat.ppid || !visited.insert(parent) {
+            return id;
+        }
+        current = parent;
     }
-    current
+    id
 }
 
 #[cfg(test)]
@@ -655,6 +643,153 @@ mod tests {
         assert_eq!(renderer.name, "slack (renderer)");
         let main = rows.iter().find(|r| r.id.pid == 100).unwrap();
         assert_eq!(main.name, "slack");
+    }
+
+    #[test]
+    fn resolve_end_target_falls_back_when_parent_cmdline_is_unreadable_or_empty() {
+        let tree = ProcTree::new();
+        tree.add_proc(ProcSpec {
+            pid: 100,
+            comm: "slack",
+            ppid: 1,
+            utime: 1,
+            stime: 0,
+            starttime: 1000,
+            vm_rss_kb: Some(1),
+            rss_anon_kb: None,
+            io: None,
+            cmdline: None,
+        });
+        tree.add_proc(ProcSpec {
+            pid: 200,
+            comm: "slack",
+            ppid: 100,
+            utime: 1,
+            stime: 0,
+            starttime: 2000,
+            vm_rss_kb: Some(1),
+            rss_anon_kb: None,
+            io: None,
+            cmdline: Some(&["slack", "--type=renderer"]),
+        });
+        let selected = ProcessId {
+            pid: 200,
+            starttime: 2000,
+        };
+
+        assert_eq!(resolve_end_target(&tree.root, selected), selected);
+
+        fs::write(tree.root.join("100/cmdline"), []).unwrap();
+        assert_eq!(resolve_end_target(&tree.root, selected), selected);
+    }
+
+    #[test]
+    fn resolve_end_target_falls_back_when_parent_stat_has_another_pid() {
+        let tree = ProcTree::new();
+        tree.add_proc(ProcSpec {
+            pid: 100,
+            comm: "slack",
+            ppid: 1,
+            utime: 1,
+            stime: 0,
+            starttime: 1000,
+            vm_rss_kb: Some(1),
+            rss_anon_kb: None,
+            io: None,
+            cmdline: Some(&["slack"]),
+        });
+        tree.add_proc(ProcSpec {
+            pid: 200,
+            comm: "slack",
+            ppid: 100,
+            utime: 1,
+            stime: 0,
+            starttime: 2000,
+            vm_rss_kb: Some(1),
+            rss_anon_kb: None,
+            io: None,
+            cmdline: Some(&["slack", "--type=renderer"]),
+        });
+        let selected = ProcessId {
+            pid: 200,
+            starttime: 2000,
+        };
+
+        let parent_stat = fs::read_to_string(tree.root.join("100/stat")).unwrap();
+        fs::write(
+            tree.root.join("100/stat"),
+            parent_stat.replacen("100 (", "101 (", 1),
+        )
+        .unwrap();
+
+        assert_eq!(resolve_end_target(&tree.root, selected), selected);
+    }
+
+    #[test]
+    fn resolve_end_target_falls_back_on_broken_or_cyclic_ancestry() {
+        let tree = ProcTree::new();
+        for (pid, ppid, starttime) in [(200, 300, 2000), (300, 200, 3000)] {
+            tree.add_proc(ProcSpec {
+                pid,
+                comm: "slack",
+                ppid,
+                utime: 1,
+                stime: 0,
+                starttime,
+                vm_rss_kb: Some(1),
+                rss_anon_kb: None,
+                io: None,
+                cmdline: Some(&["slack", "--type=renderer"]),
+            });
+        }
+        let selected = ProcessId {
+            pid: 200,
+            starttime: 2000,
+        };
+        assert_eq!(resolve_end_target(&tree.root, selected), selected);
+
+        fs::write(tree.root.join("300/stat"), "malformed").unwrap();
+        assert_eq!(resolve_end_target(&tree.root, selected), selected);
+
+        fs::remove_file(tree.root.join("300/stat")).unwrap();
+        assert_eq!(resolve_end_target(&tree.root, selected), selected);
+    }
+
+    #[test]
+    fn resolve_end_target_falls_back_at_depth_limit() {
+        let tree = ProcTree::new();
+        for pid in 200..=232 {
+            tree.add_proc(ProcSpec {
+                pid,
+                comm: "slack",
+                ppid: pid + 1,
+                utime: 1,
+                stime: 0,
+                starttime: u64::from(pid) * 10,
+                vm_rss_kb: Some(1),
+                rss_anon_kb: None,
+                io: None,
+                cmdline: Some(&["slack", "--type=renderer"]),
+            });
+        }
+        tree.add_proc(ProcSpec {
+            pid: 233,
+            comm: "slack",
+            ppid: 1,
+            utime: 1,
+            stime: 0,
+            starttime: 2330,
+            vm_rss_kb: Some(1),
+            rss_anon_kb: None,
+            io: None,
+            cmdline: Some(&["slack"]),
+        });
+        let selected = ProcessId {
+            pid: 200,
+            starttime: 2000,
+        };
+
+        assert_eq!(resolve_end_target(&tree.root, selected), selected);
     }
 
     /// Live SIGTERM against an owned disposable child, with starttime verify.

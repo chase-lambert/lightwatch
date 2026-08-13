@@ -1,8 +1,5 @@
 use crate::model::*;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::{Arc, Mutex};
 
 /// A snapshot bundled with its history for publication.
 #[derive(Clone)]
@@ -15,46 +12,61 @@ pub struct Published {
 /// A single-slot cell for the latest published data.
 /// Sampler writes; UI/consumer pulls.
 pub struct Latest {
-    generation: AtomicU64,
-    payload: Mutex<Option<Arc<Published>>>,
+    state: Mutex<LatestState>,
+}
+
+struct LatestState {
+    generation: u64,
+    payload: Option<Arc<Published>>,
 }
 
 impl Latest {
     pub fn new() -> Self {
         Self {
-            generation: AtomicU64::new(0),
-            payload: Mutex::new(None),
+            state: Mutex::new(LatestState {
+                generation: 0,
+                payload: None,
+            }),
         }
     }
 
     /// Store a new payload and bump the generation.
-    /// `Release` ordering ensures the payload is visible before the generation increment.
+    /// The generation and payload change under one lock, so readers always get
+    /// a pair from the same publication.
     pub fn publish(&self, published: Arc<Published>) -> u64 {
-        let mut guard = self.payload.lock().unwrap();
-        *guard = Some(published);
-        drop(guard);
-        self.generation.fetch_add(1, Ordering::Release) + 1
+        let mut state = self.state.lock().unwrap();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("publication generation exhausted");
+        state.payload = Some(published);
+        state.generation
     }
 
     /// Pull the latest payload with its generation number.
     pub fn pull(&self) -> Option<(u64, Arc<Published>)> {
-        let g = self.generation.load(Ordering::Acquire);
-        let guard = self.payload.lock().unwrap();
-        guard.as_ref().map(|arc| (g, Arc::clone(arc)))
+        let state = self.state.lock().unwrap();
+        state
+            .payload
+            .as_ref()
+            .map(|payload| (state.generation, Arc::clone(payload)))
     }
 
     /// Pull only if the generation is newer than `since`.
     pub fn pull_if_newer(&self, since: u64) -> Option<(u64, Arc<Published>)> {
-        let g = self.generation.load(Ordering::Acquire);
-        if g <= since {
+        let state = self.state.lock().unwrap();
+        if state.generation <= since {
             return None;
         }
-        self.pull()
+        state
+            .payload
+            .as_ref()
+            .map(|payload| (state.generation, Arc::clone(payload)))
     }
 
     /// Get current generation without pulling.
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.state.lock().unwrap().generation
     }
 }
 
@@ -67,6 +79,7 @@ impl Default for Latest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
 
     fn dummy_published(seq: u64) -> Arc<Published> {
         Arc::new(Published {
@@ -153,5 +166,33 @@ mod tests {
         assert!(g0 == 0);
         assert!(g1 > g0);
         assert!(g2 > g1);
+    }
+
+    #[test]
+    fn concurrent_pulls_keep_generation_and_payload_coherent() {
+        const PUBLICATIONS: u64 = 2_000;
+        let latest = Arc::new(Latest::new());
+        let start = Arc::new(Barrier::new(2));
+        let producer_latest = Arc::clone(&latest);
+        let producer_start = Arc::clone(&start);
+        let producer = std::thread::spawn(move || {
+            producer_start.wait();
+            for seq in 1..=PUBLICATIONS {
+                assert_eq!(producer_latest.publish(dummy_published(seq)), seq);
+            }
+        });
+
+        start.wait();
+        let mut seen = 0;
+        while seen < PUBLICATIONS {
+            if let Some((generation, payload)) = latest.pull_if_newer(seen) {
+                assert_eq!(generation, payload.snapshot.seq);
+                assert!(generation > seen);
+                seen = generation;
+            }
+            std::thread::yield_now();
+        }
+        producer.join().unwrap();
+        assert_eq!(seen, PUBLICATIONS);
     }
 }

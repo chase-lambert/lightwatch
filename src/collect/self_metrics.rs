@@ -138,12 +138,17 @@ mod collector_tests {
     impl ProcFixture {
         fn new(stat: Option<&str>, status: Option<&str>) -> Self {
             let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
             let root = std::env::temp_dir().join(format!(
-                "lightwatch-self-metrics-{}-{id}",
+                "lightwatch-self-metrics-{}-{id}-{nanos}",
                 std::process::id()
             ));
             let self_dir = root.join("self");
-            std::fs::create_dir_all(&self_dir).unwrap();
+            std::fs::create_dir(&root).expect("create owned self-metrics fixture");
+            std::fs::create_dir(&self_dir).unwrap();
             if let Some(content) = stat {
                 std::fs::write(self_dir.join("stat"), content).unwrap();
             }

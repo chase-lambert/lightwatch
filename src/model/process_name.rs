@@ -30,11 +30,7 @@ pub fn cmdline_argv0_base(cmdline: &[u8]) -> Option<&str> {
     let first = cmdline.split(|&b| b == 0).find(|a| !a.is_empty())?;
     let s = std::str::from_utf8(first).ok()?;
     let base = s.rsplit('/').next().unwrap_or(s);
-    if base.is_empty() {
-        None
-    } else {
-        Some(base)
-    }
+    if base.is_empty() { None } else { Some(base) }
 }
 
 /// Pick a full short process name: exe basename → argv0 basename → comm → `[pid]`.
@@ -135,7 +131,10 @@ mod tests {
     #[test]
     fn display_without_type() {
         let c = cmd(&["lightwatch"]);
-        assert_eq!(display_name("lightwatch", &c, Some("lightwatch"), 1), "lightwatch");
+        assert_eq!(
+            display_name("lightwatch", &c, Some("lightwatch"), 1),
+            "lightwatch"
+        );
     }
 
     #[test]

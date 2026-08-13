@@ -533,6 +533,14 @@ fn parse_cpu_online_ranges(ranges: &str) -> Result<Vec<CoreId>, String> {
                     "reversed range {start}-{end} in cpu online range: {ranges:?}"
                 ));
             }
+            let span = u64::from(end) - u64::from(start) + 1;
+            if span > MAX_CPU_CORES as u64
+                || ids.len().saturating_add(span as usize) > MAX_CPU_CORES
+            {
+                return Err(format!(
+                    "cpu online range exceeds {MAX_CPU_CORES} entries: {ranges:?}"
+                ));
+            }
             for i in start..=end {
                 ids.push(CoreId(i));
             }
@@ -540,6 +548,11 @@ fn parse_cpu_online_ranges(ranges: &str) -> Result<Vec<CoreId>, String> {
             let n = part.parse::<u32>().map_err(|_| {
                 format!("non-numeric segment {part:?} in cpu online range: {ranges:?}")
             })?;
+            if ids.len() >= MAX_CPU_CORES {
+                return Err(format!(
+                    "cpu online range exceeds {MAX_CPU_CORES} entries: {ranges:?}"
+                ));
+            }
             ids.push(CoreId(n));
         }
     }
@@ -553,6 +566,8 @@ fn parse_cpu_online_ranges(ranges: &str) -> Result<Vec<CoreId>, String> {
 /// - File missing or empty → fallback to `/proc/stat` detection.
 /// - File nonempty but unparseable → return empty (treat topology as unknown);
 ///   this ensures `is_complete_sample` cannot authorize history-ring removal.
+/// - More than `MAX_CPU_CORES` online entries also make topology unknown.
+///   Existing rings can remain stale, but normalization keeps them bounded.
 fn online_core_ids() -> Vec<CoreId> {
     let content = std::fs::read_to_string("/sys/devices/system/cpu/online").unwrap_or_default();
     let content = content.trim();
@@ -897,6 +912,16 @@ mod tests {
     fn parse_range_rejects_empty_segment() {
         // Trailing comma creates empty segment — reject.
         assert!(parse_cpu_online_ranges("0-3,").is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_work_beyond_core_limit() {
+        assert!(parse_cpu_online_ranges("0-4294967295").is_err());
+        let long_list = (0..=MAX_CPU_CORES)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_cpu_online_ranges(&long_list).is_err());
     }
 
     // ── Completeness check ──

@@ -17,7 +17,10 @@ pub struct SelfStat {
 pub fn parse_self_stat(content: &str) -> Result<SelfStat, ParseSelfError> {
     // Find the closing paren of the comm field
     let close_paren = content.rfind(')').ok_or(ParseSelfError::BadFormat)?;
-    let after_comm = &content[close_paren + 2..]; // skip ") "
+    let after_comm = content
+        .get(close_paren + 1..)
+        .ok_or(ParseSelfError::BadFormat)?
+        .trim_start();
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
 
     // After removing "(comm) " we have: state (field 3 in full, but field 1 after comm)
@@ -76,5 +79,18 @@ mod tests {
         assert_eq!(s.utime, 100);
         assert_eq!(s.stime, 50);
         assert_eq!(s.rss_pages, 300);
+    }
+
+    #[test]
+    fn rejects_closing_paren_at_end_and_truncated_fields() {
+        assert_eq!(parse_self_stat(")"), Err(ParseSelfError::BadFormat));
+        assert_eq!(
+            parse_self_stat("123 (comm)"),
+            Err(ParseSelfError::BadFormat)
+        );
+        assert_eq!(
+            parse_self_stat("123 (comm) S 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"),
+            Err(ParseSelfError::BadFormat)
+        );
     }
 }

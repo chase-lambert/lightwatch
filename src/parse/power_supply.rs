@@ -135,8 +135,12 @@ pub fn battery_from_attrs(id: &str, attrs: &BTreeMap<String, String>) -> Option<
     let charge_full = CapAttr::from_map(attrs, "charge_full");
     let charge_full_design = CapAttr::from_map(attrs, "charge_full_design");
 
-    let health_percent =
-        battery_health_percent(energy_full, energy_full_design, charge_full, charge_full_design);
+    let health_percent = battery_health_percent(
+        energy_full,
+        energy_full_design,
+        charge_full,
+        charge_full_design,
+    );
 
     let charge_percent = match attrs.get("capacity") {
         Some(c) => parse_capacity_percent(c),
@@ -209,10 +213,7 @@ mod tests {
 
     #[test]
     fn system_and_device() {
-        assert_eq!(
-            classify_battery("Battery", None),
-            Some(BatteryKind::System)
-        );
+        assert_eq!(classify_battery("Battery", None), Some(BatteryKind::System));
         assert_eq!(
             classify_battery("Battery", Some("Device")),
             Some(BatteryKind::Device)

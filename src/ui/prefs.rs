@@ -211,6 +211,35 @@ pub fn save_ui_prefs_to(path: &Path, v: &SectionVisibility) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct PrefsFixture {
+        root: PathBuf,
+    }
+
+    impl PrefsFixture {
+        fn new() -> Self {
+            let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let root = std::env::temp_dir().join(format!(
+                "lightwatch-prefs-{}-{id}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).expect("create owned preferences fixture");
+            Self { root }
+        }
+    }
+
+    impl Drop for PrefsFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
     use std::collections::BTreeSet;
 
     #[test]
@@ -313,11 +342,8 @@ show_cpu=maybe
 
     #[test]
     fn atomic_save_round_trip() {
-        let dir =
-            std::env::temp_dir().join(format!("lightwatch-prefs-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("ui.conf");
+        let fixture = PrefsFixture::new();
+        let path = fixture.root.join("ui.conf");
         let mut v = SectionVisibility {
             show_memory: false,
             ..Default::default()
@@ -326,6 +352,5 @@ show_cpu=maybe
         save_ui_prefs_to(&path, &v).unwrap();
         let loaded = load_ui_prefs_from(&path);
         assert_eq!(v, loaded);
-        let _ = fs::remove_dir_all(&dir);
     }
 }

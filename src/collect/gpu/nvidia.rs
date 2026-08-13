@@ -2,6 +2,29 @@ use super::GpuDevice;
 use crate::model::*;
 use std::sync::Mutex;
 
+struct NvmlMetrics {
+    util_percent: Reading<f32>,
+    vram_total_kb: Reading<u64>,
+    vram_used_kb: Reading<u64>,
+    temp_celsius: Reading<f32>,
+    power_watts: Reading<f32>,
+}
+
+fn snapshot_from_metrics(device: &GpuDevice, metrics: NvmlMetrics) -> GpuSnapshot {
+    GpuSnapshot {
+        pci_id: device.pci_id.clone(),
+        vendor_id: device.vendor_id.clone(),
+        device_id: device.device_id.clone(),
+        driver: device.driver.clone(),
+        name: device.name.clone(),
+        util_percent: metrics.util_percent,
+        vram_total_kb: metrics.vram_total_kb,
+        vram_used_kb: metrics.vram_used_kb,
+        temp_celsius: metrics.temp_celsius,
+        power_watts: metrics.power_watts,
+    }
+}
+
 /// Power state gate: check if the NVIDIA dGPU is positively active.
 /// Returns `true` if NVML operations are allowed.
 fn nvidia_power_gate(sys_root: &str, card: &str) -> bool {
@@ -50,7 +73,7 @@ pub fn sample_nvidia(device: &GpuDevice) -> GpuSnapshot {
 
     // Attempt NVML (cached where possible)
     match nvml_sample_cached(&device.pci_id) {
-        Ok(snap) => snap,
+        Ok(metrics) => snapshot_from_metrics(device, metrics),
         Err(reason) => GpuSnapshot {
             pci_id: device.pci_id.clone(),
             vendor_id: device.vendor_id.clone(),
@@ -84,7 +107,7 @@ static NVML_CACHE: Mutex<Option<NvmlCache>> = Mutex::new(None);
 /// Sample via the cached NVML handle. On cache miss or any failure the cache
 /// is cleared and we attempt a fresh init + device resolution, still behind
 /// the power gate (the caller has already verified the gate).
-fn nvml_sample_cached(pci_id: &str) -> Result<GpuSnapshot, &'static str> {
+fn nvml_sample_cached(pci_id: &str) -> Result<NvmlMetrics, &'static str> {
     let mut guard = NVML_CACHE.lock().unwrap();
 
     // Try the cached Nvml first.
@@ -92,7 +115,7 @@ fn nvml_sample_cached(pci_id: &str) -> Result<GpuSnapshot, &'static str> {
         match cache.nvml.device_by_pci_bus_id(pci_id) {
             Ok(device) => {
                 // query_metrics now returns Result; on GpuLost, clear cache and fall through
-                match query_metrics(&device, pci_id) {
+                match query_metrics(&device) {
                     Ok(snap) => return Ok(snap),
                     Err(_) => {
                         // Hard failure (GpuLost) — clear cache, re-init next time
@@ -118,7 +141,7 @@ fn nvml_sample_cached(pci_id: &str) -> Result<GpuSnapshot, &'static str> {
                 .device_by_pci_bus_id(pci_id)
                 .map_err(|_| "NVML device_by_pci_bus_id failed")?;
             // On GpuLost here, Err propagates and nvml is dropped (not cached).
-            match query_metrics(&device, pci_id) {
+            match query_metrics(&device) {
                 Ok(snap) => {
                     *guard = Some(NvmlCache { nvml });
                     Ok(snap)
@@ -139,7 +162,7 @@ fn nvml_sample_cached(pci_id: &str) -> Result<GpuSnapshot, &'static str> {
 /// Query all metrics from a single device in one shot.
 /// Returns `Err` on hard failures (GpuLost) — caller should clear any cache.
 /// Field-level soft failures become `Unavailable` without clearing the cache.
-fn query_metrics(device: &nvml_wrapper::Device, pci_id: &str) -> Result<GpuSnapshot, &'static str> {
+fn query_metrics(device: &nvml_wrapper::Device) -> Result<NvmlMetrics, &'static str> {
     // Helper: on GpuLost -> return Err; on other error -> Unavailable.
     fn is_lost(e: &nvml_wrapper::error::NvmlError) -> bool {
         matches!(e, nvml_wrapper::error::NvmlError::GpuLost)
@@ -187,16 +210,45 @@ fn query_metrics(device: &nvml_wrapper::Device, pci_id: &str) -> Result<GpuSnaps
         },
     };
 
-    Ok(GpuSnapshot {
-        pci_id: pci_id.to_string(),
-        vendor_id: String::new(),
-        device_id: String::new(),
-        driver: "nvidia".to_string(),
-        name: "NVIDIA GPU".to_string(),
+    Ok(NvmlMetrics {
         util_percent: util,
         vram_total_kb: vram_total,
         vram_used_kb: vram_used,
         temp_celsius: temp,
         power_watts: power,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_metrics_keep_discovered_identity() {
+        let device = GpuDevice {
+            pci_id: "0000:01:00.0".into(),
+            vendor_id: "10de".into(),
+            device_id: "25a2".into(),
+            driver: "nvidia".into(),
+            name: "NVIDIA GPU (10de:25a2)".into(),
+            drm_card: "card1".into(),
+            hwmon_path: None,
+        };
+        let snapshot = snapshot_from_metrics(
+            &device,
+            NvmlMetrics {
+                util_percent: Reading::Value(25.0),
+                vram_total_kb: Reading::Value(4_000),
+                vram_used_kb: Reading::Value(1_000),
+                temp_celsius: Reading::Value(42.0),
+                power_watts: Reading::Value(10.0),
+            },
+        );
+
+        assert_eq!(snapshot.pci_id, device.pci_id);
+        assert_eq!(snapshot.vendor_id, device.vendor_id);
+        assert_eq!(snapshot.device_id, device.device_id);
+        assert_eq!(snapshot.driver, device.driver);
+        assert_eq!(snapshot.name, device.name);
+    }
 }

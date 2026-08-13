@@ -111,30 +111,22 @@ fn read_u128_le_at(buf: &[u8], off: usize) -> Option<u128> {
     Some(u128::from_le_bytes(slice.try_into().ok()?))
 }
 
-/// Parse SMART log bytes. Requires at least 512 bytes for full field set;
-/// returns None if shorter than minimum needed for percentage_used (6 bytes).
+/// Parse a complete 512-byte SMART log. A short buffer is an incomplete read,
+/// not a successful reading with zero-valued missing fields.
 pub fn parse_nvme_smart_log(buf: &[u8]) -> Option<NvmeSmartLog> {
-    if buf.len() < 6 {
+    if buf.len() < NVME_SMART_LOG_LEN as usize {
         return None;
     }
     let critical_warning = buf[0];
-    let temp_celsius = if buf.len() >= 3 {
-        let kelvin = u16::from_le_bytes([buf[1], buf[2]]);
-        if kelvin == 0 {
-            None
-        } else {
-            Some(i32::from(kelvin) - 273)
-        }
-    } else {
+    let kelvin = u16::from_le_bytes([buf[1], buf[2]]);
+    let temp_celsius = if kelvin == 0 {
         None
+    } else {
+        Some(i32::from(kelvin) - 273)
     };
     let percentage_used = buf[5];
     // Media and Data Integrity Errors: bytes 160..176 (16-byte LE counter).
-    let media_errors = if buf.len() >= 176 {
-        read_u128_le_at(buf, 160).unwrap_or(0)
-    } else {
-        0
-    };
+    let media_errors = read_u128_le_at(buf, 160)?;
     Some(NvmeSmartLog {
         critical_warning,
         temp_celsius,
@@ -218,6 +210,9 @@ mod tests {
 
     #[test]
     fn parse_short_buffer() {
-        assert!(parse_nvme_smart_log(&[0u8; 5]).is_none());
+        for len in [0, 5, 6, 175, 176, 511] {
+            assert!(parse_nvme_smart_log(&vec![0u8; len]).is_none());
+        }
+        assert!(parse_nvme_smart_log(&[0u8; 512]).is_some());
     }
 }

@@ -1,6 +1,6 @@
 /// Small formatting helpers.
 pub fn bytes_to_human(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     let mut size = bytes as f64;
     let mut unit_idx = 0;
     while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
@@ -38,5 +38,8 @@ mod tests {
         assert_eq!(bytes_to_human(1536), "1.5 KiB");
         assert_eq!(bytes_to_human(1048576), "1.0 MiB");
         assert_eq!(bytes_to_human(1073741824), "1.0 GiB");
+        assert_eq!(bytes_to_human(1_u64 << 40), "1.0 TiB");
+        assert_eq!(bytes_to_human(1_u64 << 50), "1.0 PiB");
+        assert_eq!(bytes_to_human(u64::MAX), "16.0 EiB");
     }
 }

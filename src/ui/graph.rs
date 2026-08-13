@@ -5,7 +5,7 @@
 //! (bottom gutter), grid lines inside the plot area, series clipped to the
 //! plot rect, and a frame border drawn last.
 
-use super::graph_geom::{self, DrawWindow, PlotBounds};
+use super::graph_geom::{self, AxisKind, DrawWindow, PlotBounds};
 use super::theme;
 use crate::model::SamplePoint;
 use iced::mouse;
@@ -16,7 +16,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Pixel gutters around the inner plot rect.
-const GUTTER_LEFT: f32 = 42.0;
+///
+/// The left gutter reserves 80 pixels after the two-pixel label origin. At the
+/// 10-pixel label size, this fits the current widest tick (`16.0 EiB/s`) with
+/// space before the plot. One shared gutter keeps every chart frame aligned.
+const GUTTER_LEFT: f32 = 82.0;
 const GUTTER_TOP: f32 = 6.0;
 const GUTTER_RIGHT: f32 = 6.0;
 const GUTTER_BOTTOM: f32 = 22.0;
@@ -56,6 +60,7 @@ pub struct MultiChart<'a> {
     /// Point content itself is covered by `generation`.
     pub content_signature: u64,
     pub series: &'a [SeriesData],
+    pub axis: AxisKind,
     pub window: DrawWindow,
     /// Use gap-aware decimation when the series in-window count far exceeds
     /// the pixel budget.
@@ -70,6 +75,7 @@ impl<'a> MultiChart<'a> {
         generation: u64,
         content_signature: u64,
         series: &'a [SeriesData],
+        axis: AxisKind,
         decimate: bool,
     ) -> Self {
         Self {
@@ -77,6 +83,7 @@ impl<'a> MultiChart<'a> {
             generation,
             content_signature,
             series,
+            axis,
             window: DrawWindow {
                 sample_interval_ns: 1_000_000_000,
                 window_secs: 60.0,
@@ -132,6 +139,7 @@ pub struct ChartState {
     background: Cache,
     chrome: Cache,
     static_window_secs_bits: Cell<Option<u64>>,
+    static_axis_key: Cell<Option<u64>>,
     series: RefCell<Option<CachedSeries>>,
     presentation_window_end_ns: Cell<u64>,
 }
@@ -142,6 +150,7 @@ impl Default for ChartState {
             background: Cache::new(),
             chrome: Cache::new(),
             static_window_secs_bits: Cell::new(None),
+            static_axis_key: Cell::new(None),
             series: RefCell::new(None),
             presentation_window_end_ns: Cell::new(0),
         }
@@ -168,6 +177,11 @@ impl<Message> canvas::Program<Message> for MultiChart<'_> {
             state.background.clear();
             state.chrome.clear();
             state.static_window_secs_bits.set(Some(window_bits));
+        }
+        let axis_key = axis_key(self.axis);
+        if state.static_axis_key.get() != Some(axis_key) {
+            state.chrome.clear();
+            state.static_axis_key.set(Some(axis_key));
         }
 
         let plot_bounds = plot_bounds(bounds.size());
@@ -213,7 +227,7 @@ impl<Message> canvas::Program<Message> for MultiChart<'_> {
         }
 
         let chrome = state.chrome.draw(renderer, bounds.size(), |frame| {
-            draw_chrome(frame, self.window.window_secs, bounds.size());
+            draw_chrome(frame, self.window.window_secs, self.axis, bounds.size());
         });
 
         vec![background, series_frame.into_geometry(), chrome]
@@ -317,7 +331,7 @@ fn draw_background(frame: &mut Frame, window_secs: f64, size: Size) {
     });
 }
 
-fn draw_chrome(frame: &mut Frame, window_secs: f64, size: Size) {
+fn draw_chrome(frame: &mut Frame, window_secs: f64, axis: AxisKind, size: Size) {
     let bounds = plot_bounds(size);
     if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
         return;
@@ -326,7 +340,7 @@ fn draw_chrome(frame: &mut Frame, window_secs: f64, size: Size) {
     let label_size = 10.0;
     let x_ticks = graph_geom::compute_time_ticks(window_secs, bounds.left, bounds.right, 0);
 
-    for (y_pos, label) in graph_geom::compute_y_ticks(&bounds) {
+    for (y_pos, label) in graph_geom::compute_y_ticks(&bounds, axis) {
         frame.fill_text(Text {
             content: label,
             position: pt(2.0, y_pos - label_size * 0.5),
@@ -360,6 +374,16 @@ fn draw_chrome(frame: &mut Frame, window_secs: f64, size: Size) {
             .with_color(theme::PLOT_FRAME)
             .with_width(1.0),
     );
+}
+
+fn axis_key(axis: AxisKind) -> u64 {
+    match axis {
+        AxisKind::Percent => 0,
+        AxisKind::Bytes { max_bytes } => (1_u64 << 32) | u64::from(max_bytes.to_bits()),
+        AxisKind::BytesPerSecond {
+            max_bytes_per_second,
+        } => (2_u64 << 32) | u64::from(max_bytes_per_second.to_bits()),
+    }
 }
 
 fn build_cached_series(
@@ -563,12 +587,12 @@ mod tests {
         ]);
         let series = sample_series(points);
         let size = Size::new(640.0, 240.0);
-        let chart = MultiChart::new(ChartId::Cpu, 7, 11, &series, true);
+        let chart = MultiChart::new(ChartId::Cpu, 7, 11, &series, AxisKind::Percent, true);
         let warm = chart.series_cache_key(size);
 
         assert_eq!(warm, chart.series_cache_key(size));
 
-        let mut changed = MultiChart::new(ChartId::Cpu, 8, 11, &series, true);
+        let mut changed = MultiChart::new(ChartId::Cpu, 8, 11, &series, AxisKind::Percent, true);
         assert_ne!(warm, changed.series_cache_key(size));
         changed.generation = 7;
         changed.content_signature = 12;
@@ -595,14 +619,32 @@ mod tests {
         let storage = Arc::as_ptr(&points);
         let series = sample_series(points);
 
-        let first = MultiChart::new(ChartId::Memory, 3, 9, &series, false);
-        let second = MultiChart::new(ChartId::Memory, 3, 9, &series, false);
+        let first = MultiChart::new(ChartId::Memory, 3, 9, &series, AxisKind::Percent, false);
+        let second = MultiChart::new(ChartId::Memory, 3, 9, &series, AxisKind::Percent, false);
 
         assert_eq!(Arc::as_ptr(&first.series[0].points), storage);
         assert_eq!(Arc::as_ptr(&second.series[0].points), storage);
         assert_eq!(
             first.series_cache_key(Size::new(400.0, 180.0)),
             second.series_cache_key(Size::new(400.0, 180.0)),
+        );
+    }
+
+    #[test]
+    fn axis_key_changes_with_kind_and_scale() {
+        assert_ne!(
+            axis_key(AxisKind::Percent),
+            axis_key(AxisKind::Bytes { max_bytes: 100.0 })
+        );
+        assert_ne!(
+            axis_key(AxisKind::Bytes { max_bytes: 100.0 }),
+            axis_key(AxisKind::Bytes { max_bytes: 200.0 })
+        );
+        assert_ne!(
+            axis_key(AxisKind::Bytes { max_bytes: 100.0 }),
+            axis_key(AxisKind::BytesPerSecond {
+                max_bytes_per_second: 100.0,
+            })
         );
     }
 }

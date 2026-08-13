@@ -67,20 +67,12 @@ pub fn cmp_process_rows(
                 .name
                 .to_ascii_lowercase()
                 .cmp(&b.name.to_ascii_lowercase());
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
+            if desc { ord.reverse() } else { ord }
         }
         ProcessSortKey::Cpu => cmp_reading_f32(&a.cpu_percent, &b.cpu_percent, desc),
         ProcessSortKey::Memory => {
             let ord = a.mem_anon_kb.cmp(&b.mem_anon_kb);
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
+            if desc { ord.reverse() } else { ord }
         }
         ProcessSortKey::DiskRead => cmp_reading_u64(&a.disk_read_bytes, &b.disk_read_bytes, desc),
         ProcessSortKey::DiskWrite => {
@@ -88,11 +80,7 @@ pub fn cmp_process_rows(
         }
         ProcessSortKey::Pid => {
             let ord = a.id.pid.cmp(&b.id.pid);
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
+            if desc { ord.reverse() } else { ord }
         }
     };
     primary.then_with(|| a.id.pid.cmp(&b.id.pid))
@@ -106,11 +94,7 @@ fn cmp_reading_f32(a: &Reading<f32>, b: &Reading<f32>, desc: bool) -> std::cmp::
         (Some(_), None) => Ordering::Less,
         (Some(av), Some(bv)) => {
             let ord = av.partial_cmp(bv).unwrap_or(Ordering::Equal);
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
+            if desc { ord.reverse() } else { ord }
         }
     }
 }
@@ -123,11 +107,7 @@ fn cmp_reading_u64(a: &Reading<u64>, b: &Reading<u64>, desc: bool) -> std::cmp::
         (Some(_), None) => Ordering::Less,
         (Some(av), Some(bv)) => {
             let ord = av.cmp(bv);
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
+            if desc { ord.reverse() } else { ord }
         }
     }
 }
@@ -148,10 +128,7 @@ pub fn visible_processes(
     key: ProcessSortKey,
     desc: bool,
 ) -> VisibleProcesses {
-    let mut matched: Vec<&ProcessRow> = all
-        .iter()
-        .filter(|r| process_matches(r, query))
-        .collect();
+    let mut matched: Vec<&ProcessRow> = all.iter().filter(|r| process_matches(r, query)).collect();
     matched.sort_by(|a, b| cmp_process_rows(a, b, key, desc));
     let match_count = matched.len();
     let rows = matched.into_iter().cloned().collect();
@@ -192,9 +169,7 @@ mod tests {
             mem_anon_kb: mem,
             disk_read_bytes: match dread {
                 Some(v) => Reading::Value(v),
-                None => Reading::Unavailable {
-                    reason: "no io",
-                },
+                None => Reading::Unavailable { reason: "no io" },
             },
             disk_write_bytes: Reading::Unavailable { reason: "no io" },
         }

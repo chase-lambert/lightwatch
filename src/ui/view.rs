@@ -1,11 +1,13 @@
 use super::graph::{ChartId, MultiChart, SeriesData};
-use super::graph_geom::DrawWindow;
+use super::graph_geom::{AxisKind, DrawWindow};
 use super::prefs::{self, SectionId, SectionVisibility};
 use super::theme;
 use crate::collect::proc::{self as proc_collect, KillOutcome};
 use crate::model::*;
 use crate::sample::latest::{Latest, Published};
 use crate::sample::worker::Sampler;
+use iced::alignment::Horizontal;
+use iced::widget::text::Wrapping;
 use iced::widget::{
     Canvas, Space, button, column, container, mouse_area, responsive, row, scrollable, text,
     text_input, tooltip,
@@ -37,6 +39,10 @@ const LEGEND_ROW_H: f32 = 20.0;
 const LEGEND_COL_SPACING: f32 = 2.0;
 const SECTION_GAP: f32 = 4.0;
 const DISPLAY_INTERVAL: Duration = Duration::from_millis(100);
+const STORAGE_MOUNT_WIDTH: f32 = 100.0;
+const STORAGE_BAR_MAX_WIDTH: f32 = 140.0;
+const STORAGE_USED_WIDTH: f32 = 72.0;
+const STORAGE_SEPARATOR_WIDTH: f32 = 8.0;
 
 /// GSM-like: every *expanded* section gets an equal share of leftover height.
 const WEIGHT_SECTION: u16 = 1;
@@ -186,8 +192,10 @@ struct ProfileChartInputs {
     cpu: Vec<SeriesData>,
     memory_signature: u64,
     memory: Vec<SeriesData>,
+    memory_max_bytes: f32,
     io_signature: u64,
     io: Vec<SeriesData>,
+    io_max_bytes_per_second: f32,
 }
 
 impl ProfileChartInputs {
@@ -233,7 +241,9 @@ impl ProfileChartInputs {
             generation,
             cpu_signature: chart_content_signature(&cpu, [0]),
             memory_signature: chart_content_signature(&memory, [0]),
+            memory_max_bytes: memory[0].max_value * 1024.0,
             io_signature: chart_content_signature(&io, [0, 1]),
+            io_max_bytes_per_second: io_max,
             cpu,
             memory,
             io,
@@ -890,19 +900,30 @@ fn health_battery_panel(health: &crate::model::HealthSnapshot) -> Element<'stati
 fn mount_row(m: &crate::model::MountRow) -> Element<'static, Message> {
     let frac = (m.use_percent / 100.0).clamp(0.0, 1.0);
     let bar = fill_bar(frac, theme::ACCENT_MEM);
-    let stats = format!(
-        "{} · {} avail",
-        bytes_to_human(m.used_bytes),
-        bytes_to_human(m.available_bytes)
-    );
+    let used = bytes_to_human(m.used_bytes);
+    let available = format!("{} avail", bytes_to_human(m.available_bytes));
     row![
-        text(m.mountpoint.clone())
-            .size(12)
-            .color(theme::TEXT)
-            .width(Length::Fixed(100.0)),
+        container(
+            text(m.mountpoint.clone())
+                .size(12)
+                .color(theme::TEXT)
+                .wrapping(Wrapping::None),
+        )
+        .width(Length::Fixed(STORAGE_MOUNT_WIDTH))
+        .clip(true),
         bar,
-        Space::new().width(8),
-        text(stats).size(12).color(theme::TEXT_DIM),
+        text(used)
+            .size(12)
+            .color(theme::TEXT_DIM)
+            .width(Length::Fixed(STORAGE_USED_WIDTH))
+            .align_x(Horizontal::Right)
+            .wrapping(Wrapping::None),
+        text("·")
+            .size(12)
+            .color(theme::TEXT_DIM)
+            .width(Length::Fixed(STORAGE_SEPARATOR_WIDTH))
+            .align_x(Horizontal::Center),
+        text(available).size(12).color(theme::TEXT_DIM),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
@@ -1038,7 +1059,8 @@ fn fill_bar(fraction: f32, color: Color) -> Element<'static, Message> {
             .width(Length::Fill)
             .height(Length::Fixed(8.0)),
     )
-    .width(Length::Fixed(140.0))
+    .width(Length::Fill)
+    .max_width(STORAGE_BAR_MAX_WIDTH)
     .into()
 }
 
@@ -1207,6 +1229,7 @@ fn process_profile_body<'a>(
             app.profile_chart_inputs.generation,
             app.profile_chart_inputs.cpu_signature,
             &app.profile_chart_inputs.cpu,
+            AxisKind::Percent,
             chart_window.clone(),
             alive,
         ),
@@ -1237,6 +1260,9 @@ fn process_profile_body<'a>(
             app.profile_chart_inputs.generation,
             app.profile_chart_inputs.memory_signature,
             &app.profile_chart_inputs.memory,
+            AxisKind::Bytes {
+                max_bytes: app.profile_chart_inputs.memory_max_bytes,
+            },
             chart_window.clone(),
             false,
         ),
@@ -1270,6 +1296,9 @@ fn process_profile_body<'a>(
             app.profile_chart_inputs.generation,
             app.profile_chart_inputs.io_signature,
             &app.profile_chart_inputs.io,
+            AxisKind::BytesPerSecond {
+                max_bytes_per_second: app.profile_chart_inputs.io_max_bytes_per_second,
+            },
             chart_window,
             false,
         ),
@@ -1417,10 +1446,11 @@ fn profile_chart<'a>(
     generation: u64,
     signature: u64,
     series: &'a [SeriesData],
+    axis: AxisKind,
     window: DrawWindow,
     animate: bool,
 ) -> Element<'a, Message> {
-    let mut chart = MultiChart::new(id, generation, signature, series, true);
+    let mut chart = MultiChart::new(id, generation, signature, series, axis, true);
     chart.window = window;
     chart.animate = animate;
     Canvas::new(chart)
@@ -1831,6 +1861,7 @@ fn cpu_section<'a>(
             chart_inputs.generation,
             chart_inputs.cpu_content_signature,
             &chart_inputs.cpu_series,
+            AxisKind::Percent,
             true,
         );
         chart.window = chart_view.window();
@@ -1936,6 +1967,7 @@ fn memory_section<'a>(
             chart_inputs.generation,
             chart_inputs.memory_content_signature,
             &chart_inputs.memory_series,
+            AxisKind::Percent,
             false,
         );
         chart.window = chart_view.window();
@@ -2023,6 +2055,7 @@ fn gpu_section<'a>(
                 generation,
                 inputs.content_signature,
                 &inputs.series,
+                AxisKind::Percent,
                 false,
             );
             chart.window = chart_view.window();
