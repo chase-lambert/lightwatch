@@ -1,6 +1,7 @@
 //! Process table rows — latest-only, no history rings.
 
 use super::snapshot::Reading;
+use std::cmp::Ordering;
 
 /// Stable process identity across PID reuse: Linux `pid` + `stat` starttime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -40,15 +41,10 @@ pub fn process_matches(row: &ProcessRow, query: &str) -> bool {
     if q.is_empty() {
         return true;
     }
-    if q.chars().all(|c| c.is_ascii_digit()) {
-        let pid_str = row.id.pid.to_string();
-        if pid_str.starts_with(q) {
-            return true;
-        }
+    if q.bytes().all(|b| b.is_ascii_digit()) && pid_has_prefix(row.id.pid, q.as_bytes()) {
+        return true;
     }
-    row.name
-        .to_ascii_lowercase()
-        .contains(&q.to_ascii_lowercase())
+    contains_ignore_ascii_case(&row.name, q)
 }
 
 /// Sort key comparison with total order:
@@ -60,13 +56,10 @@ pub fn cmp_process_rows(
     b: &ProcessRow,
     key: ProcessSortKey,
     desc: bool,
-) -> std::cmp::Ordering {
+) -> Ordering {
     let primary = match key {
         ProcessSortKey::Name => {
-            let ord = a
-                .name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase());
+            let ord = cmp_ignore_ascii_case(&a.name, &b.name);
             if desc { ord.reverse() } else { ord }
         }
         ProcessSortKey::Cpu => cmp_reading_f32(&a.cpu_percent, &b.cpu_percent, desc),
@@ -86,8 +79,7 @@ pub fn cmp_process_rows(
     primary.then_with(|| a.id.pid.cmp(&b.id.pid))
 }
 
-fn cmp_reading_f32(a: &Reading<f32>, b: &Reading<f32>, desc: bool) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
+fn cmp_reading_f32(a: &Reading<f32>, b: &Reading<f32>, desc: bool) -> Ordering {
     match (a.value(), b.value()) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater, // unavailable last
@@ -99,8 +91,7 @@ fn cmp_reading_f32(a: &Reading<f32>, b: &Reading<f32>, desc: bool) -> std::cmp::
     }
 }
 
-fn cmp_reading_u64(a: &Reading<u64>, b: &Reading<u64>, desc: bool) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
+fn cmp_reading_u64(a: &Reading<u64>, b: &Reading<u64>, desc: bool) -> Ordering {
     match (a.value(), b.value()) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater,
@@ -114,39 +105,68 @@ fn cmp_reading_u64(a: &Reading<u64>, b: &Reading<u64>, desc: bool) -> std::cmp::
 
 /// Result of applying search + sort (full filtered set — no display cap).
 #[derive(Clone, Debug, PartialEq)]
-pub struct VisibleProcesses {
-    /// Rows to render (already sorted).
-    pub rows: Vec<ProcessRow>,
+pub struct VisibleProcesses<'a> {
+    /// Rows to render (already sorted). Borrowed from the snapshot.
+    pub rows: Vec<&'a ProcessRow>,
     /// Same as `rows.len()`; kept for UI count labels.
     pub match_count: usize,
 }
 
 /// Filter and sort process rows for the table body (all matches; UI scrolls).
-pub fn visible_processes(
-    all: &[ProcessRow],
+pub fn visible_processes<'a>(
+    all: &'a [ProcessRow],
     query: &str,
     key: ProcessSortKey,
     desc: bool,
-) -> VisibleProcesses {
-    let mut matched: Vec<&ProcessRow> = all.iter().filter(|r| process_matches(r, query)).collect();
-    matched.sort_by(|a, b| cmp_process_rows(a, b, key, desc));
-    let match_count = matched.len();
-    let rows = matched.into_iter().cloned().collect();
+) -> VisibleProcesses<'a> {
+    let mut rows: Vec<&ProcessRow> = all.iter().filter(|r| process_matches(r, query)).collect();
+    rows.sort_by(|a, b| cmp_process_rows(a, b, key, desc));
+    let match_count = rows.len();
     VisibleProcesses { rows, match_count }
 }
 
-/// True when `id` appears in the current visible set (search + sort).
-pub fn selection_is_visible(
-    all: &[ProcessRow],
-    query: &str,
-    key: ProcessSortKey,
-    desc: bool,
-    id: ProcessId,
-) -> bool {
-    visible_processes(all, query, key, desc)
-        .rows
-        .iter()
-        .any(|r| r.id == id)
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let hay = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.len() > hay.len() {
+        return false;
+    }
+    hay.windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Bytewise `to_ascii_lowercase` then `cmp`, without allocating.
+fn cmp_ignore_ascii_case(a: &str, b: &str) -> Ordering {
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        let ord = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn pid_has_prefix(pid: u32, prefix: &[u8]) -> bool {
+    let mut buf = [0u8; 10];
+    let digits = pid_decimal(pid, &mut buf);
+    digits.starts_with(prefix)
+}
+
+fn pid_decimal(mut pid: u32, buf: &mut [u8; 10]) -> &[u8] {
+    if pid == 0 {
+        buf[9] = b'0';
+        return &buf[9..];
+    }
+    let mut i = 10;
+    while pid > 0 {
+        i -= 1;
+        buf[i] = b'0' + (pid % 10) as u8;
+        pid /= 10;
+    }
+    &buf[i..]
 }
 
 #[cfg(test)]
@@ -270,28 +290,55 @@ mod tests {
     }
 
     #[test]
-    fn selection_hidden_by_filter() {
+    fn name_sort_matches_ascii_lowercase_byte_order() {
         let all = vec![
+            row(3, "zebra", Some(1.0), 100, None),
+            row(1, "Alpha", Some(1.0), 100, None),
+            row(2, "alpha", Some(1.0), 100, None),
+            row(4, "BETA", Some(1.0), 100, None),
+        ];
+        let v = visible_processes(&all, "", ProcessSortKey::Name, false);
+        assert_eq!(
+            v.rows.iter().map(|r| r.id.pid).collect::<Vec<_>>(),
+            vec![1, 2, 4, 3]
+        );
+        assert_eq!(
+            cmp_ignore_ascii_case("Alpha", "alpha"),
+            "Alpha"
+                .to_ascii_lowercase()
+                .cmp(&"alpha".to_ascii_lowercase())
+        );
+        assert_eq!(
+            cmp_ignore_ascii_case("Z", "aa"),
+            "Z".to_ascii_lowercase().cmp(&"aa".to_ascii_lowercase())
+        );
+    }
+
+    #[test]
+    fn selection_hidden_by_filter() {
+        let all = [
             row(1, "chrome", Some(1.0), 100, None),
             row(2, "lightwatch", Some(1.0), 50, None),
         ];
-        let id = ProcessId {
+        let hidden = ProcessId {
             pid: 1,
             starttime: 10,
         };
-        assert!(selection_is_visible(
-            &all,
-            "",
-            ProcessSortKey::Memory,
-            true,
-            id
-        ));
-        assert!(!selection_is_visible(
-            &all,
-            "light",
-            ProcessSortKey::Memory,
-            true,
-            id
-        ));
+        let visible = ProcessId {
+            pid: 2,
+            starttime: 20,
+        };
+        assert!(
+            all.iter()
+                .any(|row| row.id == hidden && process_matches(row, ""))
+        );
+        assert!(
+            !all.iter()
+                .any(|row| row.id == hidden && process_matches(row, "light"))
+        );
+        assert!(
+            all.iter()
+                .any(|row| row.id == visible && process_matches(row, "light"))
+        );
     }
 }

@@ -41,22 +41,14 @@ impl CpuCollector {
 
             let per_core_pct: Vec<CoreReading> = per_core_percent(prev, curr)
                 .into_iter()
-                .map(|(label, pct)| {
-                    // Parse core id from "cpuN" label
-                    let numeric_id = label
-                        .strip_prefix("cpu")
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0);
-                    CoreReading {
-                        id: CoreId(numeric_id),
-                        label,
-                        value: match pct {
-                            Some(v) => Reading::Value(v),
-                            None => Reading::Unavailable {
-                                reason: "new core or counter decrease",
-                            },
+                .map(|(id, pct)| CoreReading {
+                    id: CoreId(id),
+                    value: match pct {
+                        Some(v) => Reading::Value(v),
+                        None => Reading::Unavailable {
+                            reason: "new core or counter decrease",
                         },
-                    }
+                    },
                 })
                 .collect();
 

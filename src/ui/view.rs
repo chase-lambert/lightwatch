@@ -621,12 +621,21 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
     };
 
     let snap = &published.snapshot;
+    let processes = match app.active_tab {
+        AppTab::Processes if app.profiled_process.is_none() => Some(visible_processes(
+            &snap.processes,
+            &app.process_query,
+            app.process_sort,
+            app.process_sort_desc,
+        )),
+        _ => None,
+    };
     // One chrome row: tabs left, tab-specific control (presets / search) right.
-    let chrome = tab_chrome(app, snap);
+    let chrome = tab_chrome(app, processes.as_ref().map(|visible| visible.match_count));
 
     let body: Element<'_, Message> = match app.active_tab {
         AppTab::Resources => resources_body(app, snap),
-        AppTab::Processes => processes_body(app, snap),
+        AppTab::Processes => processes_body(app, snap, processes.as_ref()),
         AppTab::Health => health_body(snap),
     };
 
@@ -645,22 +654,15 @@ pub fn view(app: &Lightwatch) -> Element<'_, Message> {
 }
 
 /// Tabs on the left; trailing chrome (history presets or process search) on the right.
-fn tab_chrome<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Message> {
+fn tab_chrome<'a>(app: &'a Lightwatch, process_match_count: Option<usize>) -> Element<'a, Message> {
     let tabs = tab_buttons(app.active_tab);
     let trailing: Element<'a, Message> = match app.active_tab {
         AppTab::Resources => history_presets(app),
         AppTab::Processes => {
-            if app.profiled_process.is_some() {
-                Space::new().width(Length::Shrink).into()
-            } else {
-                let match_count = visible_processes(
-                    &snap.processes,
-                    &app.process_query,
-                    app.process_sort,
-                    app.process_sort_desc,
-                )
-                .match_count;
+            if let Some(match_count) = process_match_count {
                 process_search_trailing(app, match_count)
+            } else {
+                Space::new().width(Length::Shrink).into()
             }
         }
         AppTab::Health => Space::new().width(Length::Shrink).into(),
@@ -1072,7 +1074,11 @@ const COL_DREAD: u16 = 16;
 const COL_DWRITE: u16 = 16;
 const COL_PID: u16 = 14;
 
-fn processes_body<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Message> {
+fn processes_body<'a>(
+    app: &'a Lightwatch,
+    snap: &'a Snapshot,
+    visible: Option<&VisibleProcesses<'a>>,
+) -> Element<'a, Message> {
     if let Some(profiled) = app.profiled_process {
         return match app
             .published
@@ -1098,12 +1104,7 @@ fn processes_body<'a>(app: &'a Lightwatch, snap: &'a Snapshot) -> Element<'a, Me
         };
     }
 
-    let visible = visible_processes(
-        &snap.processes,
-        &app.process_query,
-        app.process_sort,
-        app.process_sort_desc,
-    );
+    let visible = visible.expect("process table is only built when a visible set exists");
 
     // Search lives in the shared tab chrome row; body starts at the table.
     let headers = process_header_row(app.process_sort, app.process_sort_desc);
@@ -1549,7 +1550,7 @@ fn process_header_row(sort: ProcessSortKey, desc: bool) -> Element<'static, Mess
     .into()
 }
 
-fn process_row(row: &ProcessRow, selected: bool) -> Element<'static, Message> {
+fn process_row<'a>(row: &'a ProcessRow, selected: bool) -> Element<'a, Message> {
     let cpu = match &row.cpu_percent {
         Reading::Value(v) => format!("{v:.1}"),
         Reading::Unavailable { .. } => "—".into(),
@@ -1566,13 +1567,13 @@ fn process_row(row: &ProcessRow, selected: bool) -> Element<'static, Message> {
 
     // Allow full binary names (e.g. gnome-system-monitor); still ellipsize
     // pathological long names so the row layout stays stable.
-    let name = {
-        const NAME_MAX: usize = 48;
-        let mut n = row.name.clone();
-        if n.chars().count() > NAME_MAX {
-            n = n.chars().take(NAME_MAX - 1).collect::<String>() + "…";
-        }
-        n
+    const NAME_MAX: usize = 48;
+    let name = if row.name.chars().count() > NAME_MAX {
+        let mut n: String = row.name.chars().take(NAME_MAX - 1).collect();
+        n.push('…');
+        std::borrow::Cow::Owned(n)
+    } else {
+        std::borrow::Cow::Borrowed(row.name.as_str())
     };
 
     let foreground = if selected { Color::WHITE } else { theme::TEXT };

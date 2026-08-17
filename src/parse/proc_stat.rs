@@ -1,11 +1,12 @@
 /// Parse /proc/stat — CPU aggregate and per-core counters.
-/// Returns (cpu_total_jiffies, Vec<(label, jiffies)>).
 /// The "cpu " line is aggregate; "cpuN" lines are per-core.
+/// A `cpu` suffix that is not a decimal integer is skipped, same as a
+/// short field list. Linux never emits those lines.
 /// Formula: user + nice + system + idle + iowait + irq + softirq + steal
 /// (guest is already accounted in user/nice on Linux, so we do NOT add guest separately.)
 pub fn parse_proc_stat(content: &str) -> Result<ProcStat, ParseError> {
     let mut total: Option<CpuJiffies> = None;
-    let mut cores: Vec<(String, CpuJiffies)> = Vec::new();
+    let mut cores: Vec<(u32, CpuJiffies)> = Vec::new();
 
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("cpu") {
@@ -21,15 +22,17 @@ pub fn parse_proc_stat(content: &str) -> Result<ProcStat, ParseError> {
                 let j = parse_jiffies(&fields)?;
                 total = Some(j);
             } else {
-                // "cpuN" is a per-core line; extract label
+                // "cpuN" is a per-core line; skip a non-numeric suffix.
                 let (label, rest2) = rest.split_once(' ').unwrap_or((rest, ""));
-                let name = format!("cpu{label}");
+                let Some(id) = parse_core_suffix(label) else {
+                    continue;
+                };
                 let fields: Vec<&str> = rest2.split_whitespace().collect();
                 if fields.len() < 8 {
                     continue;
                 }
                 let j = parse_jiffies(&fields)?;
-                cores.push((name, j));
+                cores.push((id, j));
             }
         }
     }
@@ -43,7 +46,14 @@ pub fn parse_proc_stat(content: &str) -> Result<ProcStat, ParseError> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcStat {
     pub total: CpuJiffies,
-    pub cores: Vec<(String, CpuJiffies)>,
+    pub cores: Vec<(u32, CpuJiffies)>,
+}
+
+fn parse_core_suffix(label: &str) -> Option<u32> {
+    if label.is_empty() || !label.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    label.parse().ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -145,16 +155,16 @@ pub fn cpu_percent(prev: &ProcStat, curr: &ProcStat) -> Option<f32> {
     Some((used_delta as f32 / total_delta as f32) * 100.0)
 }
 
-/// Per-core CPU percent, matched by label. Cores present in only one set
+/// Per-core CPU percent, matched by core id. Cores present in only one set
 /// get None (new core = no baseline; removed core = dropped).
 /// Any individual field decrease → None for that core.
-pub fn per_core_percent(prev: &ProcStat, curr: &ProcStat) -> Vec<(String, Option<f32>)> {
-    let prev_map: std::collections::HashMap<&str, &CpuJiffies> =
-        prev.cores.iter().map(|(n, j)| (n.as_str(), j)).collect();
+pub fn per_core_percent(prev: &ProcStat, curr: &ProcStat) -> Vec<(u32, Option<f32>)> {
+    let prev_map: std::collections::HashMap<u32, &CpuJiffies> =
+        prev.cores.iter().map(|(id, j)| (*id, j)).collect();
 
     let mut results = Vec::new();
-    for (name, curr_j) in &curr.cores {
-        let pct = if let Some(prev_j) = prev_map.get(name.as_str()) {
+    for (id, curr_j) in &curr.cores {
+        let pct = if let Some(prev_j) = prev_map.get(id) {
             if fields_decreased(prev_j, curr_j) {
                 None
             } else {
@@ -178,7 +188,7 @@ pub fn per_core_percent(prev: &ProcStat, curr: &ProcStat) -> Vec<(String, Option
         } else {
             None
         };
-        results.push((name.clone(), pct));
+        results.push((*id, pct));
     }
     results
 }
@@ -205,8 +215,19 @@ processes 1234
         assert_eq!(p.total.idle, 800);
         assert_eq!(p.total.total(), 990); // 100+20+50+800+10+5+5+0
         assert_eq!(p.cores.len(), 2);
-        assert_eq!(p.cores[0].0, "cpu0");
-        assert_eq!(p.cores[1].0, "cpu1");
+        assert_eq!(p.cores[0].0, 0);
+        assert_eq!(p.cores[1].0, 1);
+    }
+
+    #[test]
+    fn skips_non_numeric_cpu_suffix() {
+        let content = "cpu  100 20 50 800 10 5 5 0 0 0
+cpu0 50 10 25 400 5 2 2 0 0 0
+cpuX 50 10 25 400 5 2 2 0 0 0
+";
+        let p = parse_proc_stat(content).unwrap();
+        assert_eq!(p.cores.len(), 1);
+        assert_eq!(p.cores[0].0, 0);
     }
 
     #[test]

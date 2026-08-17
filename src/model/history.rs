@@ -55,11 +55,10 @@ impl CoreId {
     }
 }
 
-/// A labeled per-core CPU reading.
+/// A per-core CPU reading. The UI formats the label from [`CoreId`].
 #[derive(Clone, Debug)]
 pub struct CoreReading {
     pub id: CoreId,
-    pub label: String,
     pub value: Reading<f32>,
 }
 
@@ -683,17 +682,14 @@ mod tests {
         let cores: Vec<CoreReading> = vec![
             CoreReading {
                 id: CoreId(5),
-                label: "cpu5".into(),
                 value: Reading::Value(50.0),
             },
             CoreReading {
                 id: CoreId(0),
-                label: "cpu0".into(),
                 value: Reading::Value(10.0),
             },
             CoreReading {
                 id: CoreId(2),
-                label: "cpu2".into(),
                 value: Reading::Value(30.0),
             },
         ];
@@ -710,7 +706,6 @@ mod tests {
         let cores: Vec<CoreReading> = (0..260)
             .map(|i| CoreReading {
                 id: CoreId(i),
-                label: format!("cpu{i}"),
                 value: Reading::Value(0.0),
             })
             .collect();
@@ -751,17 +746,14 @@ mod tests {
         let snap = vec![
             CoreReading {
                 id: CoreId(0),
-                label: "cpu0".into(),
                 value: Reading::Value(10.0),
             },
             CoreReading {
                 id: CoreId(1),
-                label: "cpu1".into(),
                 value: Reading::Value(20.0),
             },
             CoreReading {
                 id: CoreId(2),
-                label: "cpu2".into(),
                 value: Reading::Value(30.0),
             },
         ];
@@ -786,7 +778,6 @@ mod tests {
 
         let snap = vec![CoreReading {
             id: CoreId(0),
-            label: "cpu0".into(),
             value: Reading::Value(10.0),
         }];
         hist.reconcile_cores(&config, &snap, true);
@@ -802,7 +793,6 @@ mod tests {
 
         let snap = vec![CoreReading {
             id: CoreId(0),
-            label: "cpu0".into(),
             value: Reading::Value(10.0),
         }];
         // partial sample — don't remove
@@ -841,12 +831,10 @@ mod tests {
         let partial = vec![
             CoreReading {
                 id: CoreId(0),
-                label: "cpu0".into(),
                 value: Reading::Value(10.0),
             },
             CoreReading {
                 id: CoreId(1),
-                label: "cpu1".into(),
                 value: Reading::Value(20.0),
             },
         ];
@@ -870,12 +858,10 @@ mod tests {
         let snap = vec![
             CoreReading {
                 id: CoreId(0),
-                label: "cpu0".into(),
                 value: Reading::Value(10.0),
             },
             CoreReading {
                 id: CoreId(1),
-                label: "cpu1".into(),
                 value: Reading::Value(50.0),
             },
         ];
@@ -917,12 +903,10 @@ mod tests {
         let partial = vec![
             CoreReading {
                 id: CoreId(0),
-                label: "cpu0".into(),
                 value: Reading::Value(10.0),
             },
             CoreReading {
                 id: CoreId(256),
-                label: "cpu256".into(),
                 value: Reading::Value(50.0),
             },
         ];
@@ -952,7 +936,6 @@ mod tests {
         let snap: Vec<CoreReading> = (4..12)
             .map(|i| CoreReading {
                 id: CoreId(i),
-                label: format!("cpu{i}"),
                 value: Reading::Value(0.0),
             })
             .collect();
